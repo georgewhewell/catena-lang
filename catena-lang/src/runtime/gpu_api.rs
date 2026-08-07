@@ -102,6 +102,18 @@ impl GpuApi {
         )
     }
 
+    pub(super) fn zero(&self, destination: *mut c_void, byte_len: usize) -> Result<(), MemError> {
+        if byte_len == 0 {
+            return Ok(());
+        }
+        let symbol = self.symbol("hipMemset", "cudaMemset");
+        let function: Symbol<'_, unsafe extern "C" fn(*mut c_void, c_int, usize) -> c_int> =
+            unsafe { self.load_symbol(symbol)? };
+        self.check("zero device memory", unsafe {
+            function(destination, 0, byte_len)
+        })
+    }
+
     pub(super) fn free(&self, data: *mut c_void) -> Result<(), MemError> {
         if data.is_null() {
             return Ok(());
@@ -110,6 +122,13 @@ impl GpuApi {
         let function: Symbol<'_, unsafe extern "C" fn(*mut c_void) -> c_int> =
             unsafe { self.load_symbol(symbol)? };
         self.check("free device memory", unsafe { function(data) })
+    }
+
+    pub(super) fn synchronize(&self) -> Result<(), MemError> {
+        let symbol = self.symbol("hipDeviceSynchronize", "cudaDeviceSynchronize");
+        let function: Symbol<'_, unsafe extern "C" fn() -> c_int> =
+            unsafe { self.load_symbol(symbol)? };
+        self.check("synchronize device execution", unsafe { function() })
     }
 
     fn copy(

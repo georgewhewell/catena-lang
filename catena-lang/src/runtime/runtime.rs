@@ -105,6 +105,8 @@ pub enum ExecError {
     },
     #[error("Argument {index} contains device memory from a different GPU dialect")]
     IncompatibleDeviceMemory { index: usize },
+    #[error("GPU execution failed while synchronizing: {0}")]
+    GpuSynchronization(String),
 }
 
 impl Runtime {
@@ -182,6 +184,25 @@ impl Runtime {
 
     pub fn mem_f32(&self, values: &[f32]) -> Result<MemOwn, MemError> {
         self.mem_from_bytes(slice_as_bytes(values))
+    }
+
+    /// Allocate an application-owned F32 device buffer initialized to zero.
+    pub fn mem_f32_zeroed(&self, element_count: usize) -> Result<MemOwn, MemError> {
+        let element_size = std::mem::size_of::<f32>();
+        let byte_len =
+            element_count
+                .checked_mul(element_size)
+                .ok_or(MemError::AllocationSizeOverflow {
+                    element_count,
+                    element_size,
+                })?;
+        let data = self.gpu.allocate(byte_len)?;
+        // SAFETY: `data` is the unique allocation returned immediately above
+        // by this same GPU API, and ownership is transferred into `MemOwn`.
+        let memory =
+            unsafe { MemOwn::from_raw_parts_with_gpu(data, byte_len as u64, self.gpu.clone()) };
+        self.gpu.zero(data, byte_len)?;
+        Ok(memory)
     }
 
     fn mem_from_bytes(&self, bytes: &[u8]) -> Result<MemOwn, MemError> {
@@ -294,6 +315,9 @@ impl Runtime {
 
         self.executor
             .call(&signature.symbol, &raw_inputs, &mut raw_outputs);
+        self.gpu
+            .synchronize()
+            .map_err(|error| ExecError::GpuSynchronization(error.to_string()))?;
 
         raw_outputs
             .into_iter()

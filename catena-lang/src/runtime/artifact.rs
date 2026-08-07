@@ -56,7 +56,7 @@ pub(crate) fn compile(cpp_path: &Path, dialect: GpuDialect) -> Result<Artifact, 
     let compiler = gpu_compiler(dialect);
     let compiler_display = compiler.to_string_lossy().into_owned();
     let mut command = Command::new(&compiler);
-    command.arg("-shared").arg("-O2");
+    command.arg("-shared").arg("-O3");
     match dialect {
         GpuDialect::Hip => {
             command
