@@ -188,7 +188,15 @@ impl Runtime {
 
     /// Allocate an application-owned F32 device buffer initialized to zero.
     pub fn mem_f32_zeroed(&self, element_count: usize) -> Result<MemOwn, MemError> {
-        let element_size = std::mem::size_of::<f32>();
+        self.mem_zeroed(element_count, std::mem::size_of::<f32>())
+    }
+
+    /// Allocate an application-owned BF16 device buffer initialized to zero.
+    pub fn mem_bf16_zeroed(&self, element_count: usize) -> Result<MemOwn, MemError> {
+        self.mem_zeroed(element_count, std::mem::size_of::<u16>())
+    }
+
+    fn mem_zeroed(&self, element_count: usize, element_size: usize) -> Result<MemOwn, MemError> {
         let byte_len =
             element_count
                 .checked_mul(element_size)
