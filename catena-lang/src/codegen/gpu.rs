@@ -223,6 +223,15 @@ fn render_module_body(
                 out,
                 &gated_delta_net::kernel_name(&module.entry, assignment)?,
                 dialect,
+                gated_delta_net::StorageType::F32,
+            );
+            out.push('\n');
+        } else if assignment.op.as_str() == "materializec.borrow-gated-delta-net-bf16" {
+            gated_delta_net::render_kernel(
+                out,
+                &gated_delta_net::kernel_name(&module.entry, assignment)?,
+                dialect,
+                gated_delta_net::StorageType::Bf16,
             );
             out.push('\n');
         } else if assignment.op.as_str() == "materializec.reduce-f32" {
@@ -406,9 +415,20 @@ fn render_assignment(
         "materializec.bf16-gemv" => {
             materializec::render_bf16_gemv_call(out, function, assignment, dialect)?
         }
-        "materializec.borrow-gated-delta-net-f32" => {
-            gated_delta_net::render_call(out, function, assignment, dialect)?
-        }
+        "materializec.borrow-gated-delta-net-f32" => gated_delta_net::render_call(
+            out,
+            function,
+            assignment,
+            dialect,
+            gated_delta_net::StorageType::F32,
+        )?,
+        "materializec.borrow-gated-delta-net-bf16" => gated_delta_net::render_call(
+            out,
+            function,
+            assignment,
+            dialect,
+            gated_delta_net::StorageType::Bf16,
+        )?,
         "materializec.reduce-f32" => {
             materializec::render_reduce_f32_call(out, function, assignment, dialect)?
         }
