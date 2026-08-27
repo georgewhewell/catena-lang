@@ -10,7 +10,7 @@ use crate::codegen::{
         GpuFunctionPlacement, direct_function_placement, function_placement, function_placements,
     },
     lower_types::{CType, LoweredType},
-    ops::{ifc, materializec, reducec, row_major},
+    ops::{gated_delta_net, ifc, materializec, reducec, row_major},
     prelude::render_gpu_prelude,
     render_utils::{c_type, invalid_inputs, invalid_outputs, param_decl},
     runtime_type,
@@ -207,6 +207,13 @@ fn render_module_body(
                 assignment,
             )?;
             out.push('\n');
+        } else if assignment.op.as_str() == "materializec.borrow-gated-delta-net-f32" {
+            gated_delta_net::render_kernel(
+                out,
+                &gated_delta_net::kernel_name(&module.entry, assignment)?,
+                dialect,
+            );
+            out.push('\n');
         } else if assignment.op.as_str() == "materializec.reduce-f32" {
             materializec::render_reduce_f32_kernel(
                 out,
@@ -384,6 +391,9 @@ fn render_assignment(
             materializec::render_borrow_routed_bf16_gemv_pair_call(
                 out, function, assignment, dialect,
             )?
+        }
+        "materializec.borrow-gated-delta-net-f32" => {
+            gated_delta_net::render_call(out, function, assignment, dialect)?
         }
         "materializec.reduce-f32" => {
             materializec::render_reduce_f32_call(out, function, assignment, dialect)?
