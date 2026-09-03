@@ -6,21 +6,31 @@
 //!
 //! Raw value execution is intentionally not exposed here. The typed
 //! [`causal_lm`] interface keeps read-only assets and mutable model state in the
-//! worker instead of routing model memory through a per-call transport. The
-//! lower-level [`crate::safe_runtime`] remains available for existing
-//! transient-value users.
+//! worker instead of routing model memory through a per-call transport. Session
+//! construction therefore loads the native GPU runtime only in the worker, not
+//! in the host process. The lower-level [`crate::safe_runtime`] remains
+//! available for existing transient-value users that need parent-side GPU IPC.
 
-use std::{fs::File, sync::Arc};
+use std::{fs::File, sync::Arc, time::Duration};
 
 use crate::safe_runtime::{Artifact, SafeRuntime, SessionId};
 
 pub use crate::{
     codegen::GpuDialect,
     runtime::{EntryPoint, ValueKind},
-    safe_runtime::{AssetError, ChildMainError, SafeInitError},
+    safe_runtime::{
+        AssetError, ChildMainError, DEFAULT_COMPILE_TIMEOUT, DEFAULT_EXECUTION_TIMEOUT,
+        SafeInitError, SafeRuntimeTimeouts as SessionTimeouts,
+    },
 };
 
 pub mod causal_lm;
+
+/// Maximum number of distinct read-only assets retained by one session.
+pub const MAX_RESIDENT_ASSETS: usize = crate::safe_runtime::MAX_RESIDENT_ASSETS;
+
+/// Maximum aggregate bytes of distinct read-only assets retained by one session.
+pub const MAX_RESIDENT_ASSET_BYTES: u64 = crate::safe_runtime::MAX_RESIDENT_ASSET_BYTES;
 
 /// A program compiled and retained by a [`Session`].
 ///
@@ -71,7 +81,42 @@ pub struct Session {
 impl Session {
     /// Start a worker for the selected provider-local GPU dialect.
     pub fn new(dialect: GpuDialect) -> Result<Self, SafeInitError> {
-        SafeRuntime::new(dialect).map(|runtime| Self {
+        SafeRuntime::with_resident_timeouts(dialect, SessionTimeouts::default()).map(|runtime| {
+            Self {
+                runtime: Arc::new(runtime),
+            }
+        })
+    }
+
+    /// Start a worker with a provider-selected deadline for complete Catena
+    /// source loading and GPU compilation.
+    pub fn with_compile_timeout(
+        dialect: GpuDialect,
+        compile_timeout: Duration,
+    ) -> Result<Self, SafeInitError> {
+        SafeRuntime::with_resident_timeouts(
+            dialect,
+            SessionTimeouts::default().with_compile_timeout(compile_timeout),
+        )
+        .map(|runtime| Self {
+            runtime: Arc::new(runtime),
+        })
+    }
+
+    /// Start a worker with provider-selected compile and execution deadlines.
+    ///
+    /// The execution deadline covers each control operation and the worker-side
+    /// protocol for a complete causal-LM generation. It is armed once for a
+    /// generation rather than once per decoded token. Operations are serialized
+    /// within a session: every caller, including model drop, may first wait for
+    /// the in-flight operation holding the session, and its deadline starts only
+    /// after it acquires the worker. A synchronous token callback runs on the
+    /// calling thread; the watchdog remains armed but cannot preempt that code.
+    pub fn with_timeouts(
+        dialect: GpuDialect,
+        timeouts: SessionTimeouts,
+    ) -> Result<Self, SafeInitError> {
+        SafeRuntime::with_resident_timeouts(dialect, timeouts).map(|runtime| Self {
             runtime: Arc::new(runtime),
         })
     }
