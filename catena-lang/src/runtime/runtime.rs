@@ -301,11 +301,37 @@ impl Artifact {
         self.exec_symbol(name, signature, args)
     }
 
+    /// Run a source-level program while conservatively bounding every device
+    /// allocation made by generated code during this invocation. Allocations
+    /// are charged cumulatively; generated frees do not refund the limit.
+    pub(crate) fn exec_values_with_generated_allocation_budget<'a>(
+        &self,
+        name: &str,
+        args: Vec<Value<'a>>,
+        byte_limit: u64,
+    ) -> Result<Vec<Value<'static>>, ExecError> {
+        let signature = self
+            .signatures
+            .get(name)
+            .ok_or_else(|| ExecError::UnknownSourceFunction(name.to_string()))?;
+        self.exec_symbol_with_generated_allocation_budget(name, signature, args, Some(byte_limit))
+    }
+
     fn exec_symbol<'a>(
         &self,
         name: &str,
         signature: &FunctionSignature,
         args: Vec<Value<'a>>,
+    ) -> Result<Vec<Value<'static>>, ExecError> {
+        self.exec_symbol_with_generated_allocation_budget(name, signature, args, None)
+    }
+
+    fn exec_symbol_with_generated_allocation_budget<'a>(
+        &self,
+        name: &str,
+        signature: &FunctionSignature,
+        args: Vec<Value<'a>>,
+        allocation_budget: Option<u64>,
     ) -> Result<Vec<Value<'static>>, ExecError> {
         // Check input arity lines up with what's in the function signature.
         if signature.inputs.len() != args.len() {
@@ -359,8 +385,17 @@ impl Artifact {
             })
             .collect::<Vec<_>>();
 
-        self.executor
-            .call(&signature.symbol, &raw_inputs, &mut raw_outputs);
+        match allocation_budget {
+            Some(byte_limit) => self.executor.call_with_generated_allocation_budget(
+                &signature.symbol,
+                &raw_inputs,
+                &mut raw_outputs,
+                byte_limit,
+            ),
+            None => self
+                .executor
+                .call(&signature.symbol, &raw_inputs, &mut raw_outputs),
+        }
 
         raw_outputs
             .into_iter()

@@ -1253,10 +1253,9 @@ fn render_materialize_call(
         name = output.name
     ));
     out.push_str(&format!(
-        "        catena_host_gpu_check({device_alloc_fn}((void **)&{name}_data, {name}_len * sizeof({element})));\n",
+        "        catena_host_buffer_allocate((void **)&{name}_data, {name}_len, sizeof({element}));\n",
         name = output.name,
         element = c_type(element),
-        device_alloc_fn = dialect.device_alloc_fn(),
     ));
     out.push_str(&format!(
         "        {kernel_name}<<<dim3({launch}.grid_dim.x, {launch}.grid_dim.y, {launch}.grid_dim.z), dim3({launch}.block_dim.x, {launch}.block_dim.y, {launch}.block_dim.z)>>>\n"
@@ -1626,11 +1625,12 @@ mod tests {
     }
 
     #[test]
-    fn materializing_host_wrappers_are_hidden_from_hip_device_parse() {
+    fn materializing_outputs_and_intermediates_use_the_budgeted_allocator() {
         let len = var(0, "len", CType::U64);
         let out = var(1, "out", CType::Pointer(Box::new(CType::U64)));
         let value = var(2, "value", CType::U64);
         let index = var(3, "i", CType::U64);
+        let scratch = var(4, "scratch", CType::Pointer(Box::new(CType::U64)));
 
         let materialize = GpuModule {
             name: "program_materialize".to_string(),
@@ -1639,19 +1639,42 @@ mod tests {
                 name: "program_materialize".to_string(),
                 sources: vec![len.clone()],
                 targets: vec![out.clone()],
-                assignments: vec![GpuAssign {
-                    op: op("materializec"),
-                    input_sizes: vec![1, 0, 1],
-                    output_sizes: Vec::new(),
-                    call_symbol: None,
-                    inputs: vec![
-                        GpuValue::Var(len),
-                        GpuValue::FnSymbol(FnPtrSymbol {
-                            target: op("program.producer"),
-                        }),
-                    ],
-                    outputs: vec![out],
-                }],
+                assignments: vec![
+                    GpuAssign {
+                        op: op("materializec"),
+                        input_sizes: vec![1, 0, 1],
+                        output_sizes: Vec::new(),
+                        call_symbol: None,
+                        inputs: vec![
+                            GpuValue::Var(len.clone()),
+                            GpuValue::FnSymbol(FnPtrSymbol {
+                                target: op("program.producer"),
+                            }),
+                        ],
+                        outputs: vec![scratch.clone()],
+                    },
+                    GpuAssign {
+                        op: op("buf.free"),
+                        input_sizes: vec![1],
+                        output_sizes: Vec::new(),
+                        call_symbol: None,
+                        inputs: vec![GpuValue::Var(scratch)],
+                        outputs: Vec::new(),
+                    },
+                    GpuAssign {
+                        op: op("materializec"),
+                        input_sizes: vec![1, 0, 1],
+                        output_sizes: Vec::new(),
+                        call_symbol: None,
+                        inputs: vec![
+                            GpuValue::Var(len),
+                            GpuValue::FnSymbol(FnPtrSymbol {
+                                target: op("program.producer"),
+                            }),
+                        ],
+                        outputs: vec![out],
+                    },
+                ],
             },
         };
         let producer = GpuModule {
@@ -1682,8 +1705,37 @@ mod tests {
         assert!(source.contains(
             "#ifndef __HIP_DEVICE_COMPILE__\nextern \"C\" __host__ void program_materialize(uint64_t len, uint64_t * *out_out) {"
         ));
-        assert!(source.contains("catena_host_gpu_check(hipMalloc((void **)"));
+        assert!(source.contains(
+            "catena_host_buffer_allocate((void **)&out_data, out_len, sizeof(uint64_t));"
+        ));
+        assert!(source.contains(
+            "catena_host_buffer_allocate((void **)&scratch_data, scratch_len, sizeof(uint64_t));"
+        ));
+        assert!(source.contains("catena_host_buffer_free((void *)scratch);"));
+        assert_eq!(
+            source
+                .matches("catena_host_buffer_allocate((void **)&")
+                .count(),
+            2
+        );
+        assert_eq!(
+            source.matches("hipMalloc(data, (size_t)byte_len)").count(),
+            1
+        );
+        assert!(!source.contains("hipMalloc((void **)"));
         assert!(source.contains("catena_host_gpu_check(hipDeviceSynchronize"));
         assert!(!source.contains("catena_gpu_check"));
+
+        let cuda_source = render_modules(&modules, GpuDialect::Cuda).unwrap();
+        assert!(cuda_source.contains(
+            "catena_host_buffer_allocate((void **)&out_data, out_len, sizeof(uint64_t));"
+        ));
+        assert_eq!(
+            cuda_source
+                .matches("cudaMalloc(data, (size_t)byte_len)")
+                .count(),
+            1
+        );
+        assert!(!cuda_source.contains("cudaMalloc((void **)"));
     }
 }
