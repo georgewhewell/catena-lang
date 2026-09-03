@@ -16,7 +16,7 @@ use super::mem::{MemError, MemOwn};
 #[cfg(feature = "experimental-catena-gpu")]
 use super::signature::{GeneratedFunction, generated_signatures};
 use super::{
-    signature::{FunctionSignature, SignatureTable, signatures},
+    signature::{EntryPoint, FunctionSignature, SignatureTable, entry_points, signatures},
     value::{Value, ValueKind},
 };
 use crate::codegen::{GpuDialect, gpu::GpuRenderError, gpu::render_modules};
@@ -45,6 +45,8 @@ pub struct Artifact {
     executor: Executor,
     /// Function signatures (runtime Rust ↔ C typechecking)
     signatures: SignatureTable,
+    /// Source-level entry points compiled into this artifact, sorted by name.
+    entry_points: Arc<[EntryPoint]>,
 }
 
 #[derive(Debug, Error)]
@@ -117,6 +119,8 @@ pub enum ExecError {
     },
     #[error("Argument {index} contains device memory from a different GPU dialect")]
     IncompatibleDeviceMemory { index: usize },
+    #[error("GPU execution failed while synchronizing: {0}")]
+    GpuSynchronization(String),
 }
 
 impl Runtime {
@@ -193,6 +197,7 @@ impl Runtime {
             gpu: self.gpu.clone(),
             _shared_object: shared_object,
             executor,
+            entry_points: entry_points(&signature_table).into(),
             signatures: signature_table,
         })
     }
@@ -245,6 +250,7 @@ impl Runtime {
             gpu: self.gpu.clone(),
             _shared_object: shared_object,
             executor,
+            entry_points: entry_points(&signature_table).into(),
             signatures: signature_table,
         })
     }
@@ -262,6 +268,31 @@ impl Runtime {
     /// Copy `f32` values into device memory for this context.
     pub fn mem_f32(&self, values: &[f32]) -> Result<MemOwn, MemError> {
         MemOwn::from_f32_slice(values, self.gpu.dialect())
+    }
+
+    /// Allocate an application-owned F32 device buffer initialized to zero.
+    pub fn mem_f32_zeroed(&self, element_count: usize) -> Result<MemOwn, MemError> {
+        let element_size = std::mem::size_of::<f32>();
+        let byte_len =
+            element_count
+                .checked_mul(element_size)
+                .ok_or(MemError::AllocationSizeOverflow {
+                    element_count,
+                    element_size,
+                })?;
+        self.mem_zeroed_bytes(byte_len as u64)
+    }
+
+    pub(crate) fn mem_zeroed_bytes(&self, byte_len: u64) -> Result<MemOwn, MemError> {
+        let byte_len =
+            usize::try_from(byte_len).map_err(|_| MemError::LengthTooLarge { byte_len })?;
+        let data = self.gpu.allocate(byte_len)?;
+        // SAFETY: `data` is the unique allocation returned immediately above
+        // by this same GPU API, and ownership is transferred into `MemOwn`.
+        let memory =
+            unsafe { MemOwn::from_raw_parts_with_gpu(data, byte_len as u64, self.gpu.clone()) };
+        self.gpu.zero(data, byte_len)?;
+        Ok(memory)
     }
 }
 
@@ -299,6 +330,11 @@ impl Artifact {
             .get(name)
             .ok_or_else(|| ExecError::UnknownSourceFunction(name.to_string()))?;
         self.exec_symbol(name, signature, args)
+    }
+
+    /// Source-level functions compiled into this artifact, sorted by name.
+    pub fn entry_points(&self) -> &[EntryPoint] {
+        &self.entry_points
     }
 
     /// Run a source-level program while conservatively bounding every device
@@ -397,10 +433,17 @@ impl Artifact {
                 .call(&signature.symbol, &raw_inputs, &mut raw_outputs),
         }
 
-        raw_outputs
+        // Re-establish Rust ownership before the synchronization boundary. If
+        // synchronization reports a device fault, dropping `outputs` still
+        // attempts to release every allocation returned by generated code.
+        let outputs = raw_outputs
             .into_iter()
             .map(|output| self.resolve_output(output))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        self.gpu
+            .synchronize()
+            .map_err(|error| ExecError::GpuSynchronization(error.to_string()))?;
+        Ok(outputs)
     }
 
     fn resolve_output(&self, output: AbiValue) -> Result<Value<'static>, ExecError> {
