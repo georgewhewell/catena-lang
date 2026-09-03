@@ -9,31 +9,114 @@
 
 use std::{
     env, fs,
+    fs::File,
     io::{self, BufReader, Read},
+    net::Shutdown,
+    os::fd::{AsRawFd, FromRawFd, RawFd},
+    os::unix::{net::UnixStream, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 
 use thiserror::Error;
 
+mod assets;
+mod fd_transport;
 mod ipc;
 mod protocol;
+pub(crate) mod resident;
 
 use self::{
+    assets::{AssetStore, MAX_ASSET_BYTES, validate_byte_len},
+    fd_transport::{FdTransportError, receive_file, send_file},
     ipc::{ImportedIpcAllocation, IpcMemoryHandle, IpcTransport},
     protocol::{
-        ProtocolError, RemoteExecError, Request, Response, WireExecution, WireIpcBuffer, WireValue,
-        read_frame, write_frame,
+        ProtocolError, RemoteExecError, Request, ResidentResponse, Response, WireAssetSlice,
+        WireExecution, WireIpcBuffer, WireModelBinding, WireValue, read_frame, write_frame,
     },
+    resident::ResidentStore,
 };
 use crate::{
     codegen::GpuDialect,
-    runtime::{Artifact as RuntimeArtifact, ExecError, MemError, MemOwn, Runtime, Value},
+    runtime::{
+        Artifact as RuntimeArtifact, EntryPoint, ExecError, MemError, MemOwn, Runtime, Value,
+    },
 };
 
 const CHILD_MODE_ENV: &str = "CATENA_SAFE_RUNTIME_CHILD";
+const CHILD_ASSET_SOCKET_FD: RawFd = 3;
+
+/// Failures while attaching or slicing a session-resident asset.
+#[derive(Debug, Error)]
+pub enum AssetError {
+    #[error("failed to inspect verified asset descriptor: {0}")]
+    FileMetadata(#[source] io::Error),
+    #[error("asset length must be between 1 and {maximum} bytes, got {actual}")]
+    InvalidLength { actual: u64, maximum: u64 },
+    #[error("asset transport failed: {0}")]
+    Transport(String),
+    #[error("SafeRuntime child rejected asset: {0}")]
+    Remote(String),
+    #[error("SafeRuntime child returned an unexpected asset response")]
+    UnexpectedResponse,
+    #[error("SafeRuntime child terminated while attaching an asset with {status}: {stderr}")]
+    ChildTerminated { status: ExitStatus, stderr: String },
+    #[error("SafeRuntime is unavailable because its child terminated with {status}: {stderr}")]
+    Unavailable { status: ExitStatus, stderr: String },
+    #[error("asset belongs to a different GPU session")]
+    WrongSession,
+    #[error(
+        "asset slice at offset {offset} with {byte_len} bytes exceeds its {asset_byte_len}-byte asset"
+    )]
+    InvalidSlice {
+        offset: u64,
+        byte_len: u64,
+        asset_byte_len: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AttachedAsset {
+    pub(crate) id: u64,
+    pub(crate) byte_len: u64,
+}
+
+/// Failures from the worker-resident model and generation protocol.
+#[derive(Debug, Error)]
+pub enum ResidentError {
+    #[error("resident GPU request failed: {0}")]
+    Remote(String),
+    #[error("SafeRuntime child returned an unexpected resident response")]
+    UnexpectedResponse,
+    #[error("resident GPU transport failed: {0}")]
+    Transport(String),
+    #[error("SafeRuntime child terminated during a resident GPU request with {status}: {stderr}")]
+    ChildTerminated { status: ExitStatus, stderr: String },
+    #[error("SafeRuntime is unavailable because its child terminated with {status}: {stderr}")]
+    Unavailable { status: ExitStatus, stderr: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResidentModel {
+    pub(crate) id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResidentGeneration {
+    pub(crate) id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResidentAssetSlice {
+    pub(crate) asset: u64,
+    pub(crate) offset: u64,
+    pub(crate) byte_len: u64,
+}
 
 /// Initialization failures for [`SafeRuntime`].
 #[derive(Debug, Error)]
@@ -52,6 +135,8 @@ pub enum SafeInitError {
         #[source]
         source: io::Error,
     },
+    #[error("failed to create SafeRuntime asset transport: {0}")]
+    AssetTransport(#[source] io::Error),
     #[error("SafeRuntime setup transport failed: {0}")]
     Transport(String),
     #[error("SafeRuntime child initialization failed: {0}")]
@@ -96,6 +181,8 @@ pub enum ChildMainError {
     ExpectedInitialization,
     #[error("SafeRuntime child received a second Initialize request")]
     AlreadyInitialized,
+    #[error("SafeRuntime child GPU synchronization failed: {0}")]
+    GpuSynchronization(String),
 }
 
 /// A process-isolated GPU context for compiling artifacts.
@@ -116,12 +203,32 @@ pub struct SafeRuntime {
 pub struct Artifact {
     session: Arc<SafeSession>,
     remote_id: usize,
+    entry_points: Arc<[EntryPoint]>,
 }
 
 #[derive(Debug)]
 struct SafeSession {
     worker: Mutex<WorkerProcess>,
     ipc: IpcTransport,
+    session_id: SessionId,
+}
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Identifies one process-isolated worker session.
+///
+/// Assets, programs, and models are only meaningful to the session that
+/// produced them, so every handle records the session it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SessionId(u64);
+
+impl SessionId {
+    fn new() -> Self {
+        let id = NEXT_SESSION_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("session ID space exhausted");
+        Self(id)
+    }
 }
 
 impl SafeRuntime {
@@ -139,15 +246,19 @@ impl SafeRuntime {
                 session: Arc::new(SafeSession {
                     worker: Mutex::new(worker),
                     ipc,
+                    session_id: SessionId::new(),
                 }),
             }),
             Response::Initialized(Err(error)) => Err(SafeInitError::RemoteInitialization(error)),
-            Response::Loaded(_) | Response::Executed(_) => Err(SafeInitError::UnexpectedResponse),
+            Response::Loaded(_)
+            | Response::Attached(_)
+            | Response::Resident(_)
+            | Response::Executed(_) => Err(SafeInitError::UnexpectedResponse),
         }
     }
 
     /// Compile Catena source paths into a new artifact.
-    pub fn load<I>(&mut self, paths: I) -> Result<Artifact, SafeInitError>
+    pub fn load<I>(&self, paths: I) -> Result<Artifact, SafeInitError>
     where
         I: IntoIterator<Item = PathBuf>,
     {
@@ -162,37 +273,221 @@ impl SafeRuntime {
     }
 
     /// Compile in-memory Catena sources into a new artifact.
-    pub fn load_sources<'a, I>(&mut self, sources: I) -> Result<Artifact, SafeInitError>
+    pub fn load_sources<'a, I>(&self, sources: I) -> Result<Artifact, SafeInitError>
     where
         I: IntoIterator<Item = &'a str>,
     {
         self.load_owned_sources(sources.into_iter().map(ToOwned::to_owned).collect())
     }
 
-    fn load_owned_sources(&mut self, sources: Vec<String>) -> Result<Artifact, SafeInitError> {
-        let mut worker = self
+    fn load_owned_sources(&self, sources: Vec<String>) -> Result<Artifact, SafeInitError> {
+        let worker = self
             .session
             .worker
             .lock()
             .map_err(|_| SafeInitError::Transport("worker lock was poisoned".to_string()))?;
+        let mut worker = worker;
         worker
             .send(&Request::LoadSources { sources })
             .map_err(map_init_worker_error)?;
 
         match worker.receive().map_err(map_init_worker_error)? {
-            Response::Loaded(Ok(remote_id)) => Ok(Artifact {
+            Response::Loaded(Ok((remote_id, entry_points))) => Ok(Artifact {
                 session: self.session.clone(),
                 remote_id,
+                entry_points: entry_points.into(),
             }),
             Response::Loaded(Err(error)) => Err(SafeInitError::RemoteLoad(error)),
-            Response::Initialized(_) | Response::Executed(_) => {
-                Err(SafeInitError::UnexpectedResponse)
-            }
+            Response::Initialized(_)
+            | Response::Attached(_)
+            | Response::Resident(_)
+            | Response::Executed(_) => Err(SafeInitError::UnexpectedResponse),
         }
+    }
+
+    pub(crate) fn id(&self) -> SessionId {
+        self.session.session_id
+    }
+
+    /// Attach one verified, read-only file to this worker session.
+    pub(crate) fn attach_asset(
+        &self,
+        key: [u8; 32],
+        file: File,
+    ) -> Result<AttachedAsset, AssetError> {
+        let byte_len = file.metadata().map_err(AssetError::FileMetadata)?.len();
+        if validate_byte_len(byte_len).is_err() {
+            return Err(AssetError::InvalidLength {
+                actual: byte_len,
+                maximum: MAX_ASSET_BYTES,
+            });
+        }
+
+        let mut worker = self
+            .session
+            .worker
+            .lock()
+            .map_err(|_| AssetError::Transport("worker lock was poisoned".to_string()))?;
+        if let Some(termination) = worker.termination() {
+            return Err(AssetError::Unavailable {
+                status: termination.status,
+                stderr: termination.stderr.clone(),
+            });
+        }
+        worker
+            .send(&Request::AttachAsset { key, byte_len })
+            .map_err(map_asset_worker_error)?;
+        worker.send_file(&file).map_err(map_asset_worker_error)?;
+
+        match worker.receive().map_err(map_asset_worker_error)? {
+            Response::Attached(Ok((id, reported_len))) if reported_len == byte_len => {
+                Ok(AttachedAsset { id, byte_len })
+            }
+            Response::Attached(Ok(_)) => Err(AssetError::UnexpectedResponse),
+            Response::Attached(Err(error)) => Err(AssetError::Remote(error)),
+            Response::Initialized(_)
+            | Response::Loaded(_)
+            | Response::Resident(_)
+            | Response::Executed(_) => Err(AssetError::UnexpectedResponse),
+        }
+    }
+
+    pub(crate) fn bind_resident_model(
+        &self,
+        artifact: &Artifact,
+        entry_point: String,
+        assets: Vec<ResidentAssetSlice>,
+        state_byte_multipliers: Vec<u64>,
+        vocabulary_size: u64,
+        maximum_capacity: u64,
+    ) -> Result<ResidentModel, ResidentError> {
+        if !artifact.belongs_to(self.session.session_id) {
+            return Err(ResidentError::Remote(
+                "program belongs to a different GPU session".to_string(),
+            ));
+        }
+        let binding = WireModelBinding {
+            artifact: artifact.index(),
+            entry_point,
+            assets: assets
+                .into_iter()
+                .map(|slice| WireAssetSlice {
+                    asset: slice.asset,
+                    offset: slice.offset,
+                    byte_len: slice.byte_len,
+                })
+                .collect(),
+            state_byte_multipliers,
+            vocabulary_size,
+            maximum_capacity,
+        };
+        let mut worker = self.resident_worker()?;
+        worker
+            .send(&Request::BindModel { binding })
+            .map_err(map_resident_worker_error)?;
+        match worker.receive().map_err(map_resident_worker_error)? {
+            Response::Resident(Ok(ResidentResponse::ModelBound(id))) => Ok(ResidentModel { id }),
+            Response::Resident(Err(error)) => Err(ResidentError::Remote(error)),
+            Response::Initialized(_)
+            | Response::Loaded(_)
+            | Response::Attached(_)
+            | Response::Resident(_)
+            | Response::Executed(_) => Err(ResidentError::UnexpectedResponse),
+        }
+    }
+
+    pub(crate) fn start_resident_generation(
+        &self,
+        model: ResidentModel,
+        capacity: u64,
+    ) -> Result<ResidentGeneration, ResidentError> {
+        let mut worker = self.resident_worker()?;
+        worker
+            .send(&Request::StartGeneration {
+                model: model.id,
+                capacity,
+            })
+            .map_err(map_resident_worker_error)?;
+        match worker.receive().map_err(map_resident_worker_error)? {
+            Response::Resident(Ok(ResidentResponse::GenerationStarted(id))) => {
+                Ok(ResidentGeneration { id })
+            }
+            Response::Resident(Err(error)) => Err(ResidentError::Remote(error)),
+            Response::Initialized(_)
+            | Response::Loaded(_)
+            | Response::Attached(_)
+            | Response::Resident(_)
+            | Response::Executed(_) => Err(ResidentError::UnexpectedResponse),
+        }
+    }
+
+    pub(crate) fn step_resident_generation(
+        &self,
+        generation: ResidentGeneration,
+        tokens: Vec<u32>,
+    ) -> Result<u32, ResidentError> {
+        let mut worker = self.resident_worker()?;
+        worker
+            .send(&Request::StepGeneration {
+                generation: generation.id,
+                tokens,
+            })
+            .map_err(map_resident_worker_error)?;
+        match worker.receive().map_err(map_resident_worker_error)? {
+            Response::Resident(Ok(ResidentResponse::Token(token))) => Ok(token),
+            Response::Resident(Err(error)) => Err(ResidentError::Remote(error)),
+            Response::Initialized(_)
+            | Response::Loaded(_)
+            | Response::Attached(_)
+            | Response::Resident(_)
+            | Response::Executed(_) => Err(ResidentError::UnexpectedResponse),
+        }
+    }
+
+    pub(crate) fn release_resident_generation(&self, generation: ResidentGeneration) {
+        if let Ok(mut worker) = self.resident_worker() {
+            let _ = worker.send(&Request::ReleaseGeneration {
+                generation: generation.id,
+            });
+        }
+    }
+
+    pub(crate) fn release_resident_model(&self, model: ResidentModel) {
+        if let Ok(mut worker) = self.resident_worker() {
+            let _ = worker.send(&Request::ReleaseModel { model: model.id });
+        }
+    }
+
+    fn resident_worker(&self) -> Result<std::sync::MutexGuard<'_, WorkerProcess>, ResidentError> {
+        let worker = self
+            .session
+            .worker
+            .lock()
+            .map_err(|_| ResidentError::Transport("worker lock was poisoned".to_string()))?;
+        if let Some(termination) = worker.termination() {
+            return Err(ResidentError::Unavailable {
+                status: termination.status,
+                stderr: termination.stderr.clone(),
+            });
+        }
+        Ok(worker)
     }
 }
 
 impl Artifact {
+    /// Source-level functions compiled into this artifact, sorted by name.
+    pub fn entry_points(&self) -> &[EntryPoint] {
+        &self.entry_points
+    }
+
+    pub(crate) fn belongs_to(&self, session: SessionId) -> bool {
+        self.session.session_id == session
+    }
+
+    pub(crate) fn index(&self) -> usize {
+        self.remote_id
+    }
+
     /// Run a source-level program in the child process.
     pub fn exec<'a, const M: usize, const N: usize>(
         &self,
@@ -246,7 +541,10 @@ impl Artifact {
                     "child memory IPC failed: {error}"
                 )));
             }
-            Response::Initialized(_) | Response::Loaded(_) => {
+            Response::Initialized(_)
+            | Response::Loaded(_)
+            | Response::Attached(_)
+            | Response::Resident(_) => {
                 return Err(SafeExecError::UnexpectedResponse);
             }
         };
@@ -383,11 +681,16 @@ pub fn run_safe_runtime_child_if_requested() -> Result<bool, ChildMainError> {
 
     let stdin = io::stdin();
     let stdout = io::stdout();
-    run_child_loop(stdin.lock(), stdout.lock())?;
+    let asset_socket = unsafe { UnixStream::from_raw_fd(CHILD_ASSET_SOCKET_FD) };
+    run_child_loop(stdin.lock(), stdout.lock(), &asset_socket)?;
     Ok(true)
 }
 
-fn run_child_loop(mut reader: impl Read, mut writer: impl io::Write) -> Result<(), ChildMainError> {
+fn run_child_loop(
+    mut reader: impl Read,
+    mut writer: impl io::Write,
+    asset_socket: &UnixStream,
+) -> Result<(), ChildMainError> {
     let request = read_request(&mut reader)?.ok_or(ChildMainError::ExpectedInitialization)?;
     let Request::Initialize { dialect } = request else {
         return Err(ChildMainError::ExpectedInitialization);
@@ -401,9 +704,11 @@ fn run_child_loop(mut reader: impl Read, mut writer: impl io::Write) -> Result<(
         }
     };
     let ipc = IpcTransport::from_runtime(&runtime);
+    let mut assets = AssetStore::new(dialect);
+    let mut resident = ResidentStore::new();
     write_response(&mut writer, &Response::Initialized(Ok(())))?;
 
-    let mut artifacts: Vec<Option<RuntimeArtifact>> = Vec::new();
+    let mut artifacts = ChildArtifacts::new();
     let mut pending_outputs = Vec::new();
     while let Some(request) = read_request(&mut reader)? {
         match request {
@@ -412,18 +717,57 @@ fn run_child_loop(mut reader: impl Read, mut writer: impl io::Write) -> Result<(
                 let result = runtime
                     .load_sources(sources.iter().map(String::as_str))
                     .map(|artifact| {
-                        let id = artifacts.len();
-                        artifacts.push(Some(artifact));
-                        id
+                        let entry_points = artifact.entry_points().to_vec();
+                        (artifacts.retain(artifact), entry_points)
                     })
                     .map_err(|error| error.to_string());
                 write_response(&mut writer, &Response::Loaded(result))?;
             }
+            Request::AttachAsset { key, byte_len } => {
+                let result = receive_file(asset_socket)
+                    .map_err(|error| anyhow::anyhow!(error))
+                    .and_then(|file| assets.attach(key, byte_len, file))
+                    .map(|asset| (asset.id, asset.byte_len))
+                    .map_err(|error| error.to_string());
+                write_response(&mut writer, &Response::Attached(result))?;
+            }
+            Request::BindModel { binding } => {
+                let result = resident
+                    .bind_model(&artifacts, &assets, binding)
+                    .map(ResidentResponse::ModelBound)
+                    .map_err(|error| error.to_string());
+                write_response(&mut writer, &Response::Resident(result))?;
+            }
+            Request::StartGeneration { model, capacity } => {
+                let result = resident
+                    .start_generation(&runtime, model, capacity)
+                    .map(ResidentResponse::GenerationStarted)
+                    .map_err(|error| error.to_string());
+                write_response(&mut writer, &Response::Resident(result))?;
+            }
+            Request::StepGeneration { generation, tokens } => {
+                let result = match resident
+                    .step_generation(&runtime, &artifacts, &assets, generation, tokens)
+                {
+                    Ok(token) => Ok(ResidentResponse::Token(token)),
+                    Err(error) => {
+                        if let Some(error) = resident::gpu_synchronization(&error) {
+                            return Err(ChildMainError::GpuSynchronization(error.to_string()));
+                        }
+                        Err(error.to_string())
+                    }
+                };
+                write_response(&mut writer, &Response::Resident(result))?;
+            }
+            Request::ReleaseGeneration { generation } => {
+                resident.release_generation(generation);
+            }
+            Request::ReleaseModel { model } => {
+                resident.release_model(model);
+            }
             Request::Shutdown => return Ok(()),
             Request::ReleaseArtifact { artifact } => {
-                if let Some(artifact) = artifacts.get_mut(artifact) {
-                    *artifact = None;
-                }
+                artifacts.release(artifact);
             }
             Request::ReleaseOutputs => {
                 pending_outputs.clear();
@@ -435,7 +779,7 @@ fn run_child_loop(mut reader: impl Read, mut writer: impl io::Write) -> Result<(
                 args,
             } => {
                 let response = if pending_outputs.is_empty() {
-                    match artifacts.get(artifact).and_then(Option::as_ref) {
+                    match artifacts.get(artifact) {
                         Some(artifact) => execute_in_child(
                             &ipc,
                             artifact,
@@ -443,7 +787,7 @@ fn run_child_loop(mut reader: impl Read, mut writer: impl io::Write) -> Result<(
                             buffers,
                             args,
                             &mut pending_outputs,
-                        ),
+                        )?,
                         None => Response::Executed(Err(RemoteExecError::UnknownArtifact)),
                     }
                 } else {
@@ -459,6 +803,37 @@ fn run_child_loop(mut reader: impl Read, mut writer: impl io::Write) -> Result<(
     Ok(())
 }
 
+/// Programs compiled in the worker, addressed by the identifiers the parent holds.
+///
+/// Released slots are tombstoned rather than compacted so a stale identifier
+/// can never resolve to a later program.
+#[derive(Debug, Default)]
+pub(super) struct ChildArtifacts {
+    loaded: Vec<Option<RuntimeArtifact>>,
+}
+
+impl ChildArtifacts {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn retain(&mut self, artifact: RuntimeArtifact) -> usize {
+        let id = self.loaded.len();
+        self.loaded.push(Some(artifact));
+        id
+    }
+
+    fn release(&mut self, id: usize) {
+        if let Some(slot) = self.loaded.get_mut(id) {
+            *slot = None;
+        }
+    }
+
+    pub(super) fn get(&self, id: usize) -> Option<&RuntimeArtifact> {
+        self.loaded.get(id).and_then(Option::as_ref)
+    }
+}
+
 /// Copies owned arguments into the child, runs the program, and prepares its outputs for export.
 fn execute_in_child(
     ipc: &IpcTransport,
@@ -467,10 +842,10 @@ fn execute_in_child(
     buffers: Vec<WireIpcBuffer>,
     wire_args: Vec<WireValue>,
     pending_outputs: &mut Vec<MemOwn>,
-) -> Response {
+) -> Result<Response, ChildMainError> {
     let imported = match import_ipc_buffers(ipc, buffers) {
         Ok(imported) => imported,
-        Err(error) => return Response::Executed(Err(RemoteExecError::Memory(error))),
+        Err(error) => return Ok(Response::Executed(Err(RemoteExecError::Memory(error)))),
     };
 
     let args = match wire_args
@@ -505,23 +880,23 @@ fn execute_in_child(
         .collect::<Result<Vec<_>, _>>()
     {
         Ok(args) => args,
-        Err(error) => return Response::Executed(Err(RemoteExecError::Memory(error))),
+        Err(error) => return Ok(Response::Executed(Err(RemoteExecError::Memory(error)))),
     };
 
     let values = match artifact.exec_values(name, args) {
         Ok(values) => values,
-        Err(error) => return Response::Executed(Err(RemoteExecError::Runtime(error))),
+        Err(ExecError::GpuSynchronization(error)) => {
+            return Err(ChildMainError::GpuSynchronization(error));
+        }
+        Err(error) => return Ok(Response::Executed(Err(RemoteExecError::Runtime(error)))),
     };
-    if let Err(error) = ipc.synchronize() {
-        return Response::Executed(Err(RemoteExecError::Memory(error.to_string())));
-    }
-    match encode_child_outputs(ipc, values, pending_outputs) {
+    Ok(match encode_child_outputs(ipc, values, pending_outputs) {
         Ok(execution) => Response::Executed(Ok(execution)),
         Err(error) => {
             pending_outputs.clear();
             Response::Executed(Err(error))
         }
-    }
+    })
 }
 
 fn import_ipc_buffers(
@@ -610,6 +985,7 @@ struct WorkerProcess {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    asset_socket: UnixStream,
     stderr_reader: Option<JoinHandle<Vec<u8>>>,
     termination: Option<Termination>,
 }
@@ -618,6 +994,8 @@ struct WorkerProcess {
 enum WorkerError {
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
+    #[error(transparent)]
+    AssetDescriptor(#[from] FdTransportError),
     #[error("failed to wait for SafeRuntime child: {0}")]
     Wait(#[source] io::Error),
     #[error("SafeRuntime child terminated")]
@@ -626,16 +1004,31 @@ enum WorkerError {
 
 impl WorkerProcess {
     fn spawn(executable: &Path) -> Result<Self, SafeInitError> {
-        let mut child = Command::new(executable)
+        let (asset_socket, child_asset_socket) =
+            UnixStream::pair().map_err(SafeInitError::AssetTransport)?;
+        let child_asset_fd = child_asset_socket.as_raw_fd();
+        let mut command = Command::new(executable);
+        command
             .env(CHILD_MODE_ENV, "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| SafeInitError::Spawn {
-                executable: executable.to_path_buf(),
-                source,
-            })?;
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(child_asset_fd, CHILD_ASSET_SOCKET_FD) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::fcntl(CHILD_ASSET_SOCKET_FD, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|source| SafeInitError::Spawn {
+            executable: executable.to_path_buf(),
+            source,
+        })?;
+        drop(child_asset_socket);
         let stdin = child
             .stdin
             .take()
@@ -658,6 +1051,7 @@ impl WorkerProcess {
             child,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
+            asset_socket,
             stderr_reader: Some(stderr_reader),
             termination: None,
         })
@@ -679,6 +1073,14 @@ impl WorkerProcess {
             Some(response) => Ok(response),
             None => Err(WorkerError::Terminated(self.reap()?)),
         }
+    }
+
+    fn send_file(&mut self, file: &File) -> Result<(), WorkerError> {
+        if let Err(error) = send_file(&self.asset_socket, file) {
+            let _ = self.asset_socket.shutdown(Shutdown::Both);
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     fn termination(&self) -> Option<&Termination> {
@@ -739,5 +1141,25 @@ fn map_exec_worker_error(error: WorkerError) -> SafeExecError {
             stderr: termination.stderr,
         },
         other => SafeExecError::Transport(other.to_string()),
+    }
+}
+
+fn map_asset_worker_error(error: WorkerError) -> AssetError {
+    match error {
+        WorkerError::Terminated(termination) => AssetError::ChildTerminated {
+            status: termination.status,
+            stderr: termination.stderr,
+        },
+        other => AssetError::Transport(other.to_string()),
+    }
+}
+
+fn map_resident_worker_error(error: WorkerError) -> ResidentError {
+    match error {
+        WorkerError::Terminated(termination) => ResidentError::ChildTerminated {
+            status: termination.status,
+            stderr: termination.stderr,
+        },
+        other => ResidentError::Transport(other.to_string()),
     }
 }
