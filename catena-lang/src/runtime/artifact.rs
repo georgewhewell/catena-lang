@@ -66,6 +66,8 @@ pub(crate) fn compile(cpp_path: &Path, dialect: GpuDialect) -> Result<Artifact, 
     }
 
     std::fs::copy(cpp_path, &module_path)?;
+    let uses_hipblas =
+        dialect == GpuDialect::Hip && std::fs::read_to_string(cpp_path)?.contains("hipblasGemmEx");
 
     let compiler = gpu_compiler(dialect);
     let compiler_display = compiler.to_string_lossy().into_owned();
@@ -92,10 +94,11 @@ pub(crate) fn compile(cpp_path: &Path, dialect: GpuDialect) -> Result<Artifact, 
                 .arg("--fmad=false");
         }
     }
+    command.arg(&module_path).arg("-o").arg(&so_path);
+    if uses_hipblas {
+        command.arg("-lhipblas");
+    }
     let output = command
-        .arg(&module_path)
-        .arg("-o")
-        .arg(&so_path)
         .output()
         .map_err(|source| ArtifactError::CompilerUnavailable {
             compiler: compiler_display.clone(),
