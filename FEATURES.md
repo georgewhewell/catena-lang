@@ -165,6 +165,99 @@ One kernel shares term setup and synchronization barriers between the two
 trees without changing either tree's arithmetic. The current implementation
 supports `K ≤ 8192`.
 
+## `materializec.bf16-gemm-wmma`
+
+```text
+materializec.bf16-gemm-wmma[I, W, N, K] :
+  Bufᵒʷⁿ(I, BF16)
+  ⊗ ⟦I : U64⟧
+  ⊗ Bufʳᵉᶠ(W, BF16)
+  ⊗ ⟦W : U64⟧
+  ⊗ ⟦N : U64⟧
+  ⊗ ⟦K : U64⟧
+  ⊗ Val(U64)
+  ⊗ Val(U64)
+  ⊸ Bufᵒʷⁿ(N, BF16)
+```
+
+The final values are `input_row` and `output_features`. The operation has the
+same row-major shape, capacity, ownership, and BF16-output contract as
+`materializec.bf16-gemv`: it computes selected rows of the input matrix times
+the transpose of the row-major weight matrix, accumulates in F32, and rounds
+once to BF16.
+
+This operation is HIP/gfx11-only. For 64 or more input rows, one 32-lane wave
+computes each 16×16 output tile with rocWMMA BF16 16×16×16 instructions and
+F32 accumulator fragments. Shared-memory edge tiles zero-pad row, column, and
+reduction tails. Inputs with fewer than 64 rows use the existing packed-BF16
+SIMT kernel, which keeps token-at-a-time decode on its established path.
+
+Unlike the regular primitive, this fast operation does not promise the
+canonical adjacent-pair reduction order: WMMA groups and accumulates products
+according to the matrix instruction. It is therefore selected explicitly by
+the caller when that numerical tradeoff is acceptable.
+
+## `materializec.bf16-gemm-hipblas`
+
+```text
+materializec.bf16-gemm-hipblas[I, W, N, K] :
+  Bufᵒʷⁿ(I, BF16)
+  ⊗ ⟦I : U64⟧
+  ⊗ Bufʳᵉᶠ(W, BF16)
+  ⊗ ⟦W : U64⟧
+  ⊗ ⟦N : U64⟧
+  ⊗ ⟦K : U64⟧
+  ⊗ U64
+  ⊗ U64
+  → Bufᵒʷⁿ(N, BF16)
+```
+
+This HIP-only operation has the same row-major shape, capacity, ownership, and
+BF16-output contract as `materializec.bf16-gemv`. For at least 64 selected input
+rows it calls `hipblasGemmEx` with BF16 inputs and output and F32 accumulation.
+The generated module reuses one hipBLAS handle on the default stream and links
+hipBLAS only when this primitive is present. Smaller inputs retain the packed
+BF16 SIMT kernel, preserving the established decode path.
+
+The hipBLAS path does not promise the canonical adjacent-pair reduction order;
+the library selects its GEMM algorithm and accumulation grouping.
+
+## Dense paired native-BF16 projections
+
+```text
+materializec.borrow-native-bf16-gemv-pair[I, G, U, N, K] :
+  Bufᵒʷⁿ(I, BF16) ⊗ ⟦I : U64⟧
+  ⊗ Bufʳᵉᶠ(G, BF16) ⊗ ⟦G : U64⟧
+  ⊗ Bufʳᵉᶠ(U, BF16) ⊗ ⟦U : U64⟧
+  ⊗ ⟦N : U64⟧ ⊗ ⟦K : U64⟧
+  ⊗ Val(U64) ⊗ Val(U64)
+  ⊸ Bufᵒʷⁿ(I, BF16) ⊗ Bufᵒʷⁿ(N, BF16) ⊗ Bufᵒʷⁿ(N, BF16)
+```
+
+The scalar values are `input_row` and `output_features`. This dense paired
+projection multiplies the same selected BF16 input rows by separate row-major
+gate and up matrices. It accumulates the two products independently in F32,
+rounds each result once to BF16, and returns the borrowed input owner with both
+outputs. On supported AMD targets the SIMT implementation uses packed BF16 dot
+instructions.
+
+The following operations have the same ownership, capacity, shape, and output
+contract:
+
+```text
+materializec.borrow-native-bf16-gemm-wmma-pair[I, G, U, N, K]
+materializec.borrow-native-bf16-gemm-hipblas-pair[I, G, U, N, K]
+```
+
+For at least 64 selected rows, the WMMA form launches one rocWMMA GEMM for each
+weight matrix, while the hipBLAS form makes two `hipblasGemmEx` calls through
+the module's shared handle. Both use BF16 inputs and outputs with F32
+accumulation. Smaller row counts use the fused paired SIMT kernel, so decode
+does not pay matrix-library or matrix-core setup costs. Like their single
+projection counterparts, the accelerated paths do not promise canonical
+adjacent-pair reduction order and are HIP-only; the WMMA form additionally
+requires gfx11.
+
 ## `materializec.borrow-routed-bf16-gemv-pair`
 
 ```text

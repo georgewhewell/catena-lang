@@ -750,6 +750,90 @@ pub(in crate::codegen) fn render_borrow_routed_bf16_gemv_pair_kernel(
     Ok(())
 }
 
+pub(in crate::codegen) fn render_borrow_native_bf16_gemv_pair_kernel(
+    out: &mut String,
+    kernel_name: &str,
+    assignment: &GpuAssign,
+    dialect: GpuDialect,
+) -> Result<(), GpuRenderError> {
+    let [input_output, gate_output, up_output] = assignment.outputs.as_slice() else {
+        return Err(invalid_outputs(assignment, 3));
+    };
+    for output in [input_output, gate_output, up_output] {
+        let Some(CType::Pointer(element)) = runtime_type(output) else {
+            return Err(GpuRenderError::ErasedType(output.clone()));
+        };
+        if element.as_ref() != &CType::BF16 {
+            return Err(GpuRenderError::UnsupportedType(
+                runtime_type(output).unwrap().clone(),
+            ));
+        }
+    }
+    let _ = borrow_native_bf16_gemv_pair_parts(assignment)?;
+
+    out.push_str(&format!(
+        "__global__ void {kernel_name}(const catena_bf16_t *input, const catena_bf16_t *gate_weight, const catena_bf16_t *up_weight, catena_bf16_t *gate_out, catena_bf16_t *up_out, uint64_t output_len, uint64_t reduction_len, uint64_t input_row, uint64_t output_features) {{\n"
+    ));
+    out.push_str("    uint64_t output_index = (uint64_t)blockIdx.x;\n");
+    out.push_str("    if (output_index >= output_len) { return; }\n");
+    out.push_str("    uint64_t row = input_row + output_index / output_features;\n");
+    out.push_str("    uint64_t output_feature = output_index % output_features;\n");
+    out.push_str("    uint64_t input_base = row * reduction_len;\n");
+    out.push_str("    uint64_t weight_base = output_feature * reduction_len;\n");
+    out.push_str("    float gate_sum = 0.0f;\n    float up_sum = 0.0f;\n");
+    out.push_str("    uint64_t pair_count = reduction_len >> 1;\n");
+    if dialect == GpuDialect::Hip {
+        out.push_str("#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)\n");
+        out.push_str(
+            "    typedef __bf16 catena_native_bf16x2_t __attribute__((ext_vector_type(2)));\n",
+        );
+        out.push_str("#endif\n");
+    }
+    out.push_str("    for (uint64_t pair = (uint64_t)threadIdx.x; pair < pair_count; pair += (uint64_t)blockDim.x) {\n");
+    match dialect {
+        GpuDialect::Hip => {
+            out.push_str("#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)\n");
+            out.push_str("        union { uint32_t bits; catena_native_bf16x2_t values; } input_pair, gate_pair, up_pair;\n");
+            out.push_str("        __builtin_memcpy(&input_pair.bits, input + input_base + (pair << 1), sizeof(uint32_t));\n");
+            out.push_str("        __builtin_memcpy(&gate_pair.bits, gate_weight + weight_base + (pair << 1), sizeof(uint32_t));\n");
+            out.push_str("        __builtin_memcpy(&up_pair.bits, up_weight + weight_base + (pair << 1), sizeof(uint32_t));\n");
+            out.push_str("        gate_sum = __builtin_amdgcn_fdot2_f32_bf16(input_pair.values, gate_pair.values, gate_sum, false);\n");
+            out.push_str("        up_sum = __builtin_amdgcn_fdot2_f32_bf16(input_pair.values, up_pair.values, up_sum, false);\n");
+            out.push_str("#else\n");
+            out.push_str("        uint64_t index = pair << 1;\n");
+            out.push_str("        float x0 = catena_bf16_to_f32(input[input_base + index]);\n");
+            out.push_str("        float x1 = catena_bf16_to_f32(input[input_base + index + 1]);\n");
+            out.push_str("        gate_sum += x0 * catena_bf16_to_f32(gate_weight[weight_base + index]) + x1 * catena_bf16_to_f32(gate_weight[weight_base + index + 1]);\n");
+            out.push_str("        up_sum += x0 * catena_bf16_to_f32(up_weight[weight_base + index]) + x1 * catena_bf16_to_f32(up_weight[weight_base + index + 1]);\n");
+            out.push_str("#endif\n");
+        }
+        GpuDialect::Cuda => {
+            out.push_str("        uint64_t index = pair << 1;\n");
+            out.push_str("        float x0 = catena_bf16_to_f32(input[input_base + index]);\n");
+            out.push_str("        float x1 = catena_bf16_to_f32(input[input_base + index + 1]);\n");
+            out.push_str("        gate_sum += x0 * catena_bf16_to_f32(gate_weight[weight_base + index]) + x1 * catena_bf16_to_f32(gate_weight[weight_base + index + 1]);\n");
+            out.push_str("        up_sum += x0 * catena_bf16_to_f32(up_weight[weight_base + index]) + x1 * catena_bf16_to_f32(up_weight[weight_base + index + 1]);\n");
+        }
+    }
+    out.push_str("    }\n");
+    out.push_str("    if ((reduction_len & 1) != 0 && threadIdx.x == 0) {\n");
+    out.push_str("        uint64_t index = reduction_len - 1;\n");
+    out.push_str("        float x = catena_bf16_to_f32(input[input_base + index]);\n");
+    out.push_str("        gate_sum += x * catena_bf16_to_f32(gate_weight[weight_base + index]);\n");
+    out.push_str("        up_sum += x * catena_bf16_to_f32(up_weight[weight_base + index]);\n");
+    out.push_str("    }\n");
+    out.push_str(
+        "    __shared__ float gate_partial[256];\n    __shared__ float up_partial[256];\n",
+    );
+    out.push_str("    gate_partial[threadIdx.x] = gate_sum;\n    up_partial[threadIdx.x] = up_sum;\n    __syncthreads();\n");
+    out.push_str("    for (uint32_t stride = 128; stride != 0; stride >>= 1) {\n");
+    out.push_str("        if (threadIdx.x < stride) { gate_partial[threadIdx.x] += gate_partial[threadIdx.x + stride]; up_partial[threadIdx.x] += up_partial[threadIdx.x + stride]; }\n");
+    out.push_str("        __syncthreads();\n    }\n");
+    out.push_str("    if (threadIdx.x == 0) { gate_out[output_index] = catena_bf16_from_f32(gate_partial[0]); up_out[output_index] = catena_bf16_from_f32(up_partial[0]); }\n");
+    out.push_str("}\n");
+    Ok(())
+}
+
 pub(in crate::codegen) fn render_borrow_routed_native_bf16_gemv_pair_kernel(
     out: &mut String,
     kernel_name: &str,
@@ -1013,6 +1097,126 @@ pub(in crate::codegen) fn render_bf16_gemv_kernel(
     );
     out.push_str("}\n");
     Ok(())
+}
+
+fn render_bf16_gemm_wmma_kernel(out: &mut String, kernel_name: &str) {
+    out.push_str("#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)\n");
+    out.push_str("#include <rocwmma/rocwmma.hpp>\n");
+    out.push_str(&format!(
+        "__global__ void {kernel_name}(const catena_bf16_t *input, const catena_bf16_t *weight, catena_bf16_t *out, uint64_t rows, uint64_t reduction_len, uint64_t input_row, uint64_t output_features) {{\n"
+    ));
+    out.push_str("    using frag_a_t = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, catena_bf16_t, rocwmma::row_major>;\n");
+    out.push_str("    using frag_b_t = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, catena_bf16_t, rocwmma::col_major>;\n");
+    out.push_str(
+        "    using frag_c_t = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float>;\n",
+    );
+    out.push_str("    uint64_t row_base = (uint64_t)blockIdx.y * 16;\n    uint64_t column_base = (uint64_t)blockIdx.x * 16;\n");
+    out.push_str("    __shared__ catena_bf16_t tile_a[16 * 16];\n    __shared__ catena_bf16_t tile_b[16 * 16];\n    __shared__ float tile_c[16 * 16];\n");
+    out.push_str("    frag_a_t a; frag_b_t b; frag_c_t c;\n    rocwmma::fill_fragment(c, 0.0f);\n");
+    out.push_str("    for (uint64_t k_base = 0; k_base < reduction_len; k_base += 16) {\n        for (uint32_t flat = threadIdx.x; flat < 256; flat += blockDim.x) {\n");
+    out.push_str("            uint32_t tile_row = flat >> 4; uint32_t tile_column = flat & 15;\n            uint64_t row = row_base + tile_row; uint64_t k = k_base + tile_column;\n");
+    out.push_str("            tile_a[flat] = (row < rows && k < reduction_len) ? input[(input_row + row) * reduction_len + k] : catena_bf16_from_f32(0.0f);\n");
+    out.push_str("            uint64_t column = column_base + tile_row;\n            tile_b[flat] = (column < output_features && k < reduction_len) ? weight[column * reduction_len + k] : catena_bf16_from_f32(0.0f);\n");
+    out.push_str("        }\n        __syncthreads();\n        rocwmma::load_matrix_sync(a, tile_a, 16);\n        rocwmma::load_matrix_sync(b, tile_b, 16);\n        rocwmma::mma_sync(c, a, b, c);\n        __syncthreads();\n    }\n");
+    out.push_str("    rocwmma::store_matrix_sync(tile_c, c, 16, rocwmma::mem_row_major);\n    __syncthreads();\n");
+    out.push_str("    for (uint32_t flat = threadIdx.x; flat < 256; flat += blockDim.x) {\n        uint64_t row = row_base + (flat >> 4); uint64_t column = column_base + (flat & 15);\n        if (row < rows && column < output_features) out[row * output_features + column] = catena_bf16_from_f32(tile_c[flat]);\n    }\n}\n#endif\n");
+}
+
+/// Render an opt-in HIP BF16 GEMM. gfx11 executes one wave per 16x16 output
+/// tile through rocWMMA; the companion SIMT kernel handles inputs below the
+/// measured 64-row crossover. This operation is intentionally gfx11-only.
+pub(in crate::codegen) fn render_bf16_gemm_wmma_kernels(
+    out: &mut String,
+    kernel_name: &str,
+    assignment: &GpuAssign,
+) -> Result<(), GpuRenderError> {
+    render_bf16_gemv_kernel(
+        out,
+        &format!("{kernel_name}_simt"),
+        assignment,
+        GpuDialect::Hip,
+    )?;
+    render_bf16_gemm_wmma_kernel(out, kernel_name);
+    Ok(())
+}
+
+pub(in crate::codegen) fn render_borrow_native_bf16_gemm_wmma_pair_kernels(
+    out: &mut String,
+    kernel_name: &str,
+    assignment: &GpuAssign,
+) -> Result<(), GpuRenderError> {
+    render_borrow_native_bf16_gemv_pair_kernel(
+        out,
+        &format!("{kernel_name}_simt"),
+        assignment,
+        GpuDialect::Hip,
+    )?;
+    render_bf16_gemm_wmma_kernel(out, &format!("{kernel_name}_gate"));
+    render_bf16_gemm_wmma_kernel(out, &format!("{kernel_name}_up"));
+    Ok(())
+}
+
+pub(in crate::codegen) fn render_hipblas_support(out: &mut String) {
+    out.push_str(
+        r#"#include <hipblas/hipblas.h>
+#ifndef __HIP_DEVICE_COMPILE__
+__host__ static inline void catena_host_hipblas_check(hipblasStatus_t status) {
+    if (status != HIPBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "catena hipBLAS error: %s\n", hipblasStatusToString(status));
+        fflush(stderr);
+        __builtin_trap();
+    }
+}
+
+struct catena_hipblas_context_t {
+    hipblasHandle_t handle;
+
+    catena_hipblas_context_t() : handle(nullptr) {
+        catena_host_hipblas_check(hipblasCreate(&handle));
+        catena_host_hipblas_check(hipblasSetPointerMode(handle, HIPBLAS_POINTER_MODE_HOST));
+        catena_host_hipblas_check(hipblasSetStream(handle, nullptr));
+    }
+
+    ~catena_hipblas_context_t() {
+        if (handle != nullptr) {
+            (void)hipblasDestroy(handle);
+        }
+    }
+};
+
+__host__ static inline hipblasHandle_t catena_host_hipblas_handle() {
+    static catena_hipblas_context_t context;
+    return context.handle;
+}
+#endif
+"#,
+    );
+}
+
+pub(in crate::codegen) fn render_bf16_gemm_hipblas_kernels(
+    out: &mut String,
+    kernel_name: &str,
+    assignment: &GpuAssign,
+) -> Result<(), GpuRenderError> {
+    render_bf16_gemv_kernel(
+        out,
+        &format!("{kernel_name}_simt"),
+        assignment,
+        GpuDialect::Hip,
+    )
+}
+
+pub(in crate::codegen) fn render_borrow_native_bf16_gemm_hipblas_pair_kernels(
+    out: &mut String,
+    kernel_name: &str,
+    assignment: &GpuAssign,
+) -> Result<(), GpuRenderError> {
+    render_borrow_native_bf16_gemv_pair_kernel(
+        out,
+        &format!("{kernel_name}_simt"),
+        assignment,
+        GpuDialect::Hip,
+    )
 }
 
 pub(in crate::codegen) fn render_borrow_argmax_f32_kernel(
@@ -1467,6 +1671,142 @@ pub(in crate::codegen) fn render_borrow_routed_bf16_gemv_pair_call(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::codegen) enum NativeBf16PairBackend {
+    Simt,
+    Wmma,
+    Hipblas,
+}
+
+pub(in crate::codegen) fn render_borrow_native_bf16_gemm_pair_call(
+    out: &mut String,
+    function: &GpuFunction,
+    assignment: &GpuAssign,
+    dialect: GpuDialect,
+    backend: NativeBf16PairBackend,
+) -> Result<(), GpuRenderError> {
+    let [input_output, gate_output, up_output] = assignment.outputs.as_slice() else {
+        return Err(invalid_outputs(assignment, 3));
+    };
+    let (
+        input,
+        input_capacity,
+        gate_weight,
+        gate_capacity,
+        up_weight,
+        up_capacity,
+        output_len,
+        reduction_len,
+        input_row,
+        output_features,
+    ) = borrow_native_bf16_gemv_pair_parts(assignment)?;
+    let input_capacity = value_expr(input_capacity);
+    let gate_capacity = value_expr(gate_capacity);
+    let up_capacity = value_expr(up_capacity);
+    let output_len = value_expr(output_len);
+    let reduction_len = value_expr(reduction_len);
+    let input_row = value_expr(input_row);
+    let output_features = value_expr(output_features);
+    let kernel_name = kernel_name(&function.name, assignment)?;
+    let prefix = &gate_output.name;
+
+    out.push_str(&format!("    catena_assert(({reduction_len}) != 0);\n"));
+    out.push_str(&format!(
+        "    catena_assert(({input_capacity}) % ({reduction_len}) == 0);\n"
+    ));
+    out.push_str(&format!(
+        "    uint64_t {prefix}_input_rows = ({input_capacity}) / ({reduction_len});\n"
+    ));
+    out.push_str(&format!("    catena_assert(({output_features}) != 0);\n"));
+    out.push_str(&format!(
+        "    catena_assert(({output_len}) % ({output_features}) == 0);\n"
+    ));
+    out.push_str(&format!(
+        "    uint64_t {prefix}_rows = ({output_len}) / ({output_features});\n"
+    ));
+    out.push_str(&format!(
+        "    catena_assert(({input_row}) <= {prefix}_input_rows && {prefix}_rows <= {prefix}_input_rows - ({input_row}));\n"
+    ));
+    out.push_str(&format!(
+        "    catena_assert(({output_features}) <= UINT64_MAX / ({reduction_len}));\n"
+    ));
+    out.push_str(&format!(
+        "    catena_assert(({gate_capacity}) == ({output_features}) * ({reduction_len}) && ({up_capacity}) == ({gate_capacity}));\n"
+    ));
+    out.push_str(&format!(
+        "    catena_bf16_t *{}_data = nullptr;\n    catena_bf16_t *{}_data = nullptr;\n",
+        gate_output.name, up_output.name
+    ));
+    out.push_str(&format!("    if (({output_len}) != 0) {{\n"));
+    for output in [gate_output, up_output] {
+        out.push_str(&format!(
+            "        catena_host_gpu_check({}((void **)&{}_data, ({output_len}) * sizeof(catena_bf16_t), nullptr));\n",
+            dialect.device_alloc_async_fn(),
+            output.name
+        ));
+    }
+    match backend {
+        NativeBf16PairBackend::Simt => {
+            out.push_str(&format!(
+                "        {kernel_name}<<<dim3({output_len}), dim3(256)>>>(\n            {}, {}, {}, {}_data, {}_data, {output_len}, {reduction_len}, {input_row}, {output_features});\n",
+                value_expr(input),
+                value_expr(gate_weight),
+                value_expr(up_weight),
+                gate_output.name,
+                up_output.name,
+            ));
+        }
+        NativeBf16PairBackend::Wmma => {
+            out.push_str(&format!(
+                "        if ({prefix}_rows >= 64) {{\n            {kernel_name}_gate<<<dim3((({output_features}) + 15) / 16, ({prefix}_rows + 15) / 16), dim3(32)>>>(\n                {}, {}, {}_data, {prefix}_rows, {reduction_len}, {input_row}, {output_features});\n            {kernel_name}_up<<<dim3((({output_features}) + 15) / 16, ({prefix}_rows + 15) / 16), dim3(32)>>>(\n                {}, {}, {}_data, {prefix}_rows, {reduction_len}, {input_row}, {output_features});\n        }} else {{\n            {kernel_name}_simt<<<dim3({output_len}), dim3(256)>>>(\n                {}, {}, {}, {}_data, {}_data, {output_len}, {reduction_len}, {input_row}, {output_features});\n        }}\n",
+                value_expr(input),
+                value_expr(gate_weight),
+                gate_output.name,
+                value_expr(input),
+                value_expr(up_weight),
+                up_output.name,
+                value_expr(input),
+                value_expr(gate_weight),
+                value_expr(up_weight),
+                gate_output.name,
+                up_output.name,
+            ));
+        }
+        NativeBf16PairBackend::Hipblas => {
+            out.push_str(&format!(
+                "        if ({prefix}_rows >= 64) {{\n            catena_assert(({output_features}) <= INT32_MAX && {prefix}_rows <= INT32_MAX && ({reduction_len}) <= INT32_MAX);\n            const float {prefix}_alpha = 1.0f;\n            const float {prefix}_beta = 0.0f;\n"
+            ));
+            for (weight, output) in [(gate_weight, gate_output), (up_weight, up_output)] {
+                out.push_str(&format!(
+                    "            catena_host_hipblas_check(hipblasGemmEx(\n                catena_host_hipblas_handle(), HIPBLAS_OP_T, HIPBLAS_OP_N,\n                (int)({output_features}), (int){prefix}_rows, (int)({reduction_len}),\n                &{prefix}_alpha, {}, HIP_R_16BF, (int)({reduction_len}),\n                {} + ({input_row}) * ({reduction_len}), HIP_R_16BF, (int)({reduction_len}),\n                &{prefix}_beta, {}_data, HIP_R_16BF, (int)({output_features}),\n                HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));\n",
+                    value_expr(weight),
+                    value_expr(input),
+                    output.name,
+                ));
+            }
+            out.push_str(&format!(
+                "        }} else {{\n            {kernel_name}_simt<<<dim3({output_len}), dim3(256)>>>(\n                {}, {}, {}, {}_data, {}_data, {output_len}, {reduction_len}, {input_row}, {output_features});\n        }}\n",
+                value_expr(input),
+                value_expr(gate_weight),
+                value_expr(up_weight),
+                gate_output.name,
+                up_output.name,
+            ));
+        }
+    }
+    out.push_str("    }\n");
+    out.push_str(&format!(
+        "    {} = {};\n    {} = {}_data;\n    {} = {}_data;\n",
+        input_output.name,
+        value_expr(input),
+        gate_output.name,
+        gate_output.name,
+        up_output.name,
+        up_output.name,
+    ));
+    Ok(())
+}
+
 pub(in crate::codegen) fn render_borrow_routed_native_bf16_gemv_pair_call(
     out: &mut String,
     function: &GpuFunction,
@@ -1702,6 +2042,108 @@ pub(in crate::codegen) fn render_bf16_gemv_call(
     ));
     out.push_str("    }\n");
     out.push_str(&format!("    {} = {}_data;\n", output.name, output.name));
+    Ok(())
+}
+
+pub(in crate::codegen) fn render_bf16_gemm_wmma_call(
+    out: &mut String,
+    function: &GpuFunction,
+    assignment: &GpuAssign,
+) -> Result<(), GpuRenderError> {
+    let [output] = assignment.outputs.as_slice() else {
+        return Err(invalid_outputs(assignment, 1));
+    };
+    let (
+        input,
+        input_capacity,
+        weight,
+        weight_capacity,
+        output_len,
+        reduction_len,
+        input_row,
+        output_features,
+    ) = bf16_gemv_parts(assignment)?;
+    let input_capacity = value_expr(input_capacity);
+    let weight_capacity = value_expr(weight_capacity);
+    let output_len = value_expr(output_len);
+    let reduction_len = value_expr(reduction_len);
+    let input_row = value_expr(input_row);
+    let output_features = value_expr(output_features);
+    let kernel_name = kernel_name(&function.name, assignment)?;
+    let name = &output.name;
+    out.push_str(&format!(
+        "    uint64_t {name}_len = {output_len};\n    catena_bf16_t *{name}_data = nullptr;\n"
+    ));
+    out.push_str(&format!("    catena_assert(({reduction_len}) != 0);\n    catena_assert(({input_capacity}) % ({reduction_len}) == 0);\n    uint64_t {name}_input_rows = ({input_capacity}) / ({reduction_len});\n    catena_assert(({output_features}) != 0);\n    catena_assert({name}_len % ({output_features}) == 0);\n    uint64_t {name}_rows = {name}_len / ({output_features});\n"));
+    out.push_str(&format!("    catena_assert(({input_row}) <= {name}_input_rows && {name}_rows <= {name}_input_rows - ({input_row}));\n    catena_assert(({output_features}) <= UINT64_MAX / ({reduction_len}));\n    catena_assert(({weight_capacity}) == ({output_features}) * ({reduction_len}));\n"));
+    out.push_str(&format!("    if ({name}_len != 0) {{\n        catena_host_gpu_check(hipMallocAsync((void **)&{name}_data, {name}_len * sizeof(catena_bf16_t), nullptr));\n"));
+    out.push_str(&format!("        if ({name}_rows >= 64) {{\n            {kernel_name}<<<dim3((({output_features}) + 15) / 16, ({name}_rows + 15) / 16), dim3(32)>>>(\n                {}, {}, {name}_data, {name}_rows, {reduction_len}, {input_row}, {output_features});\n        }} else\n", value_expr(input), value_expr(weight)));
+    out.push_str(&format!("        {{\n            {kernel_name}_simt<<<dim3({name}_len), dim3(256)>>>(\n                {}, {}, {name}_data, {name}_len, {reduction_len}, {input_row}, {output_features});\n        }}\n    }}\n    {name} = {name}_data;\n", value_expr(input), value_expr(weight)));
+    Ok(())
+}
+
+pub(in crate::codegen) fn render_bf16_gemm_hipblas_call(
+    out: &mut String,
+    function: &GpuFunction,
+    assignment: &GpuAssign,
+) -> Result<(), GpuRenderError> {
+    let [output] = assignment.outputs.as_slice() else {
+        return Err(invalid_outputs(assignment, 1));
+    };
+    let (
+        input,
+        input_capacity,
+        weight,
+        weight_capacity,
+        output_len,
+        reduction_len,
+        input_row,
+        output_features,
+    ) = bf16_gemv_parts(assignment)?;
+    let kernel_name = kernel_name(&function.name, assignment)?;
+    let name = &output.name;
+
+    out.push_str(&format!(
+        r#"    uint64_t {name}_len = {output_len};
+    catena_bf16_t *{name}_data = nullptr;
+    catena_assert(({reduction_len}) != 0);
+    catena_assert(({input_capacity}) % ({reduction_len}) == 0);
+    uint64_t {name}_input_rows = ({input_capacity}) / ({reduction_len});
+    catena_assert(({output_features}) != 0);
+    catena_assert({name}_len % ({output_features}) == 0);
+    uint64_t {name}_rows = {name}_len / ({output_features});
+    catena_assert(({input_row}) <= {name}_input_rows && {name}_rows <= {name}_input_rows - ({input_row}));
+    catena_assert(({output_features}) <= UINT64_MAX / ({reduction_len}));
+    catena_assert(({weight_capacity}) == ({output_features}) * ({reduction_len}));
+    if ({name}_len != 0) {{
+        catena_host_gpu_check(hipMallocAsync((void **)&{name}_data, {name}_len * sizeof(catena_bf16_t), nullptr));
+        if ({name}_rows >= 64) {{
+            catena_assert(({output_features}) <= INT32_MAX && {name}_rows <= INT32_MAX && ({reduction_len}) <= INT32_MAX);
+            const float {name}_alpha = 1.0f;
+            const float {name}_beta = 0.0f;
+            catena_host_hipblas_check(hipblasGemmEx(
+                catena_host_hipblas_handle(), HIPBLAS_OP_T, HIPBLAS_OP_N,
+                (int)({output_features}), (int){name}_rows, (int)({reduction_len}),
+                &{name}_alpha, {weight}, HIP_R_16BF, (int)({reduction_len}),
+                {input} + ({input_row}) * ({reduction_len}), HIP_R_16BF, (int)({reduction_len}),
+                &{name}_beta, {name}_data, HIP_R_16BF, (int)({output_features}),
+                HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
+        }} else {{
+            {kernel_name}_simt<<<dim3({name}_len), dim3(256)>>>(
+                {input}, {weight}, {name}_data, {name}_len, {reduction_len}, {input_row}, {output_features});
+        }}
+    }}
+    {name} = {name}_data;
+"#,
+        input = value_expr(input),
+        input_capacity = value_expr(input_capacity),
+        weight = value_expr(weight),
+        weight_capacity = value_expr(weight_capacity),
+        output_len = value_expr(output_len),
+        reduction_len = value_expr(reduction_len),
+        input_row = value_expr(input_row),
+        output_features = value_expr(output_features),
+    ));
     Ok(())
 }
 
@@ -2131,6 +2573,57 @@ fn borrow_reduce_f32_parts(
         single_runtime_input(assignment, "output_len", output_len)?,
         single_runtime_input(assignment, "reduction_len", reduction_len)?,
         env,
+    ))
+}
+
+fn borrow_native_bf16_gemv_pair_parts(
+    assignment: &GpuAssign,
+) -> Result<
+    (
+        &GpuValue,
+        &GpuValue,
+        &GpuValue,
+        &GpuValue,
+        &GpuValue,
+        &GpuValue,
+        &GpuValue,
+        &GpuValue,
+        &GpuValue,
+        &GpuValue,
+    ),
+    GpuRenderError,
+> {
+    let components = input_components(assignment)?;
+    let [
+        input,
+        input_capacity,
+        gate_weight,
+        gate_capacity,
+        up_weight,
+        up_capacity,
+        output_len,
+        reduction_len,
+        input_row,
+        output_features,
+    ] = components.as_slice()
+    else {
+        return Err(GpuRenderError::InvalidInputComponentCount {
+            op: assignment.op.clone(),
+            expected: 10,
+            actual: components.len(),
+        });
+    };
+    Ok((
+        single_runtime_input(assignment, "input", input)?,
+        single_runtime_input(assignment, "input_capacity", input_capacity)?,
+        single_runtime_input(assignment, "gate_weight", gate_weight)?,
+        single_runtime_input(assignment, "gate_capacity", gate_capacity)?,
+        single_runtime_input(assignment, "up_weight", up_weight)?,
+        single_runtime_input(assignment, "up_capacity", up_capacity)?,
+        single_runtime_input(assignment, "output_len", output_len)?,
+        single_runtime_input(assignment, "reduction_len", reduction_len)?,
+        single_runtime_input(assignment, "input_row", input_row)?,
+        single_runtime_input(assignment, "output_features", output_features)?,
     ))
 }
 
