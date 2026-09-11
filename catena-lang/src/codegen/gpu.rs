@@ -98,8 +98,8 @@ pub fn render_module(module: &GpuModule, dialect: GpuDialect) -> Result<String, 
     let mut out = String::new();
     out.push_str(&render_gpu_prelude(dialect));
     out.push('\n');
-    if dialect == GpuDialect::Hip && function_uses_hipblas(&module.entry) {
-        materializec::render_hipblas_support(&mut out);
+    if function_uses_blas(&module.entry) {
+        materializec::render_blas_support(&mut out, dialect);
         out.push('\n');
     }
     render_module_body(
@@ -119,12 +119,11 @@ pub fn render_modules(
     let mut out = String::new();
     out.push_str(&render_gpu_prelude(dialect));
     out.push('\n');
-    if dialect == GpuDialect::Hip
-        && modules
-            .values()
-            .any(|module| function_uses_hipblas(&module.entry))
+    if modules
+        .values()
+        .any(|module| function_uses_blas(&module.entry))
     {
-        materializec::render_hipblas_support(&mut out);
+        materializec::render_blas_support(&mut out, dialect);
         out.push('\n');
     }
     let placements = function_placements(modules);
@@ -154,11 +153,11 @@ pub fn render_modules(
     Ok(out)
 }
 
-fn function_uses_hipblas(function: &GpuFunction) -> bool {
+fn function_uses_blas(function: &GpuFunction) -> bool {
     function.assignments.iter().any(|assignment| {
         matches!(
             assignment.op.as_str(),
-            "materializec.bf16-gemm-hipblas" | "materializec.borrow-native-bf16-gemm-hipblas-pair"
+            "materializec.bf16-gemm-blas" | "materializec.borrow-native-bf16-gemm-blas-pair"
         )
     })
 }
@@ -256,23 +255,19 @@ fn render_module_body(
             )?;
             out.push('\n');
         } else if assignment.op.as_str() == "materializec.borrow-native-bf16-gemm-wmma-pair" {
-            if dialect != GpuDialect::Hip {
-                return Err(GpuRenderError::UnsupportedOp(assignment.op.clone()));
-            }
             materializec::render_borrow_native_bf16_gemm_wmma_pair_kernels(
                 out,
                 &materializec::kernel_name(&module.entry.name, assignment)?,
                 assignment,
+                dialect,
             )?;
             out.push('\n');
-        } else if assignment.op.as_str() == "materializec.borrow-native-bf16-gemm-hipblas-pair" {
-            if dialect != GpuDialect::Hip {
-                return Err(GpuRenderError::UnsupportedOp(assignment.op.clone()));
-            }
-            materializec::render_borrow_native_bf16_gemm_hipblas_pair_kernels(
+        } else if assignment.op.as_str() == "materializec.borrow-native-bf16-gemm-blas-pair" {
+            materializec::render_borrow_native_bf16_gemm_blas_pair_kernels(
                 out,
                 &materializec::kernel_name(&module.entry.name, assignment)?,
                 assignment,
+                dialect,
             )?;
             out.push('\n');
         } else if assignment.op.as_str() == "materializec.borrow-routed-native-bf16-gemv-pair" {
@@ -300,23 +295,19 @@ fn render_module_body(
             )?;
             out.push('\n');
         } else if assignment.op.as_str() == "materializec.bf16-gemm-wmma" {
-            if dialect != GpuDialect::Hip {
-                return Err(GpuRenderError::UnsupportedOp(assignment.op.clone()));
-            }
             materializec::render_bf16_gemm_wmma_kernels(
                 out,
                 &materializec::kernel_name(&module.entry.name, assignment)?,
                 assignment,
+                dialect,
             )?;
             out.push('\n');
-        } else if assignment.op.as_str() == "materializec.bf16-gemm-hipblas" {
-            if dialect != GpuDialect::Hip {
-                return Err(GpuRenderError::UnsupportedOp(assignment.op.clone()));
-            }
-            materializec::render_bf16_gemm_hipblas_kernels(
+        } else if assignment.op.as_str() == "materializec.bf16-gemm-blas" {
+            materializec::render_bf16_gemm_blas_kernels(
                 out,
                 &materializec::kernel_name(&module.entry.name, assignment)?,
                 assignment,
+                dialect,
             )?;
             out.push('\n');
         } else if assignment.op.as_str() == "materializec.borrow-gated-delta-net-f32" {
@@ -537,9 +528,6 @@ fn render_assignment(
             )?
         }
         "materializec.borrow-native-bf16-gemm-wmma-pair" => {
-            if dialect != GpuDialect::Hip {
-                return Err(GpuRenderError::UnsupportedOp(assignment.op.clone()));
-            }
             materializec::render_borrow_native_bf16_gemm_pair_call(
                 out,
                 function,
@@ -548,16 +536,13 @@ fn render_assignment(
                 materializec::NativeBf16PairBackend::Wmma,
             )?
         }
-        "materializec.borrow-native-bf16-gemm-hipblas-pair" => {
-            if dialect != GpuDialect::Hip {
-                return Err(GpuRenderError::UnsupportedOp(assignment.op.clone()));
-            }
+        "materializec.borrow-native-bf16-gemm-blas-pair" => {
             materializec::render_borrow_native_bf16_gemm_pair_call(
                 out,
                 function,
                 assignment,
                 dialect,
-                materializec::NativeBf16PairBackend::Hipblas,
+                materializec::NativeBf16PairBackend::Blas,
             )?
         }
         "materializec.borrow-routed-native-bf16-gemv-pair" => {
@@ -574,16 +559,10 @@ fn render_assignment(
             materializec::render_bf16_gemv_call(out, function, assignment, dialect)?
         }
         "materializec.bf16-gemm-wmma" => {
-            if dialect != GpuDialect::Hip {
-                return Err(GpuRenderError::UnsupportedOp(assignment.op.clone()));
-            }
-            materializec::render_bf16_gemm_wmma_call(out, function, assignment)?
+            materializec::render_bf16_gemm_wmma_call(out, function, assignment, dialect)?
         }
-        "materializec.bf16-gemm-hipblas" => {
-            if dialect != GpuDialect::Hip {
-                return Err(GpuRenderError::UnsupportedOp(assignment.op.clone()));
-            }
-            materializec::render_bf16_gemm_hipblas_call(out, function, assignment)?
+        "materializec.bf16-gemm-blas" => {
+            materializec::render_bf16_gemm_blas_call(out, function, assignment, dialect)?
         }
         "materializec.borrow-gated-delta-net-f32" => gated_delta_net::render_call(
             out,
