@@ -66,8 +66,9 @@ pub(crate) fn compile(cpp_path: &Path, dialect: GpuDialect) -> Result<Artifact, 
     }
 
     std::fs::copy(cpp_path, &module_path)?;
-    let uses_hipblas =
-        dialect == GpuDialect::Hip && std::fs::read_to_string(cpp_path)?.contains("hipblasGemmEx");
+    let source = std::fs::read_to_string(cpp_path)?;
+    let uses_blas = source.contains("catena_host_blas_gemm");
+    let uses_wmma = dialect == GpuDialect::Cuda && source.contains("nvcuda::wmma");
 
     let compiler = gpu_compiler(dialect);
     let compiler_display = compiler.to_string_lossy().into_owned();
@@ -92,11 +93,17 @@ pub(crate) fn compile(cpp_path: &Path, dialect: GpuDialect) -> Result<Artifact, 
                 .arg("--std=c++17")
                 // Match the no-FMA intent for generated arithmetic.
                 .arg("--fmad=false");
+            if uses_wmma {
+                command.arg("-arch=native");
+            }
         }
     }
     command.arg(&module_path).arg("-o").arg(&so_path);
-    if uses_hipblas {
-        command.arg("-lhipblas");
+    if uses_blas {
+        command.arg(match dialect {
+            GpuDialect::Hip => "-lhipblas",
+            GpuDialect::Cuda => "-lcublas",
+        });
     }
     let output = command
         .output()
