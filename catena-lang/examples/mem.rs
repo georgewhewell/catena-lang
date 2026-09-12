@@ -40,13 +40,13 @@ const SOURCE: &str = r#"
 "#;
 
 fn main() -> anyhow::Result<()> {
-    let runtime =
-        Runtime::from_sources(stdlib::sources().chain([SOURCE]), configured_gpu_dialect()?)?;
+    let runtime = Runtime::new(configured_gpu_dialect()?)?;
+    let artifact = runtime.load_sources(stdlib::sources().chain([SOURCE]))?;
 
     let owned = runtime.mem_u64(&[3, 5])?;
     let borrowed = runtime.mem_u64(&[8, 13])?;
 
-    let [returned, sum] = runtime.exec(
+    let [returned, sum] = artifact.exec(
         "add-first-and-return-owned",
         [owned.into(), borrowed.as_ref().into()],
     )?;

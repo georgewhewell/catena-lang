@@ -1,21 +1,100 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     codegen::{GpuModuleMap, lower_types::CType},
     runtime::value::ValueKind,
 };
 
+/// C ABI metadata for one entry point in generated GPU source.
+#[cfg(feature = "experimental-catena-gpu")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedFunction {
+    pub source_name: String,
+    pub symbol: String,
+    pub inputs: Vec<ValueKind>,
+    pub outputs: Vec<ValueKind>,
+}
+
+/// Read-only source-level function signature exposed by a loaded artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryPoint {
+    name: String,
+    inputs: Vec<ValueKind>,
+    outputs: Vec<ValueKind>,
+}
+
+impl EntryPoint {
+    pub(crate) fn new(name: String, inputs: Vec<ValueKind>, outputs: Vec<ValueKind>) -> Self {
+        Self {
+            name,
+            inputs,
+            outputs,
+        }
+    }
+
+    /// Source-level function name used for execution.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Ordered input kinds, including memory ownership.
+    pub fn inputs(&self) -> &[ValueKind] {
+        &self.inputs
+    }
+
+    /// Ordered output kinds, including memory ownership.
+    pub fn outputs(&self) -> &[ValueKind] {
+        &self.outputs
+    }
+}
+
 #[derive(Debug, Clone)]
-pub(crate) struct FunctionSignature {
-    pub(crate) symbol: String,
-    pub(crate) inputs: Vec<ValueKind>,
-    pub(crate) outputs: Vec<ValueKind>,
+pub(super) struct FunctionSignature {
+    pub(super) symbol: String,
+    pub(super) inputs: Vec<ValueKind>,
+    pub(super) outputs: Vec<ValueKind>,
 }
 
 /// Source-level program names and their generated C ABI signatures.
-pub(crate) type SignatureTable = HashMap<String, FunctionSignature>;
+pub(super) type SignatureTable = HashMap<String, FunctionSignature>;
 
-pub(crate) fn signatures(modules: &GpuModuleMap) -> SignatureTable {
+#[cfg(feature = "experimental-catena-gpu")]
+pub(super) fn generated_signatures(
+    functions: impl IntoIterator<Item = GeneratedFunction>,
+) -> SignatureTable {
+    functions
+        .into_iter()
+        .map(|function| {
+            (
+                function.source_name,
+                FunctionSignature {
+                    symbol: function.symbol,
+                    inputs: function.inputs,
+                    outputs: function.outputs,
+                },
+            )
+        })
+        .collect()
+}
+
+pub(super) fn entry_points(signatures: &SignatureTable) -> Vec<EntryPoint> {
+    let mut entries = signatures
+        .iter()
+        .map(|(name, signature)| {
+            EntryPoint::new(
+                name.clone(),
+                signature.inputs.clone(),
+                signature.outputs.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    entries
+}
+
+pub(super) fn signatures(modules: &GpuModuleMap) -> SignatureTable {
     let mut signatures = HashMap::new();
     for module in modules.values() {
         let Some(source_name) = &module.source_name else {

@@ -7,13 +7,20 @@ use std::{
 
 use thiserror::Error;
 
-use super::{executor::CatenaMem, gpu_api::GpuApi};
+use super::executor::CatenaMem;
 use crate::codegen::GpuDialect;
+use crate::gpu::GpuApi;
 
 #[derive(Debug, Error)]
 pub enum MemError {
+    #[error("invalid shared GPU allocation: {reason}")]
+    InvalidSharedAllocation { reason: &'static str },
+    #[error("failed to manage shared GPU allocation descriptor: {0}")]
+    SharedHandleIo(#[source] std::io::Error),
+    #[error("no usable {dialect:?} GPU device is available")]
+    NoDevice { dialect: GpuDialect },
     #[error(
-        "failed to load {dialect:?} runtime library (tried: {tried}): {source}",
+        "failed to load {dialect:?} GPU library (tried: {tried}): {source}",
         tried = display_paths(tried)
     )]
     LoadLibrary {
@@ -22,7 +29,7 @@ pub enum MemError {
         #[source]
         source: libloading::Error,
     },
-    #[error("failed to resolve {dialect:?} runtime symbol `{symbol}`: {source}")]
+    #[error("failed to resolve {dialect:?} GPU symbol `{symbol}`: {source}")]
     LoadSymbol {
         dialect: GpuDialect,
         symbol: &'static str,
@@ -63,6 +70,30 @@ pub struct MemRef<'a> {
 }
 
 impl MemOwn {
+    /// Copy a slice into a new device allocation.
+    pub fn from_u64_slice(values: &[u64], dialect: GpuDialect) -> Result<Self, MemError> {
+        Self::from_bytes(slice_as_bytes(values), dialect)
+    }
+
+    /// Copy a slice into a new device allocation.
+    pub fn from_u16_slice(values: &[u16], dialect: GpuDialect) -> Result<Self, MemError> {
+        Self::from_bytes(slice_as_bytes(values), dialect)
+    }
+
+    /// Copy a slice into a new device allocation.
+    pub fn from_f32_slice(values: &[f32], dialect: GpuDialect) -> Result<Self, MemError> {
+        Self::from_bytes(slice_as_bytes(values), dialect)
+    }
+
+    fn from_bytes(bytes: &[u8], dialect: GpuDialect) -> Result<Self, MemError> {
+        let gpu = GpuApi::load(dialect)?;
+        let data = gpu.allocate(bytes.len())?;
+        // SAFETY: `data` was just allocated by this same GPU API.
+        let mut memory = unsafe { Self::from_raw_parts_with_gpu(data, bytes.len() as u64, gpu) };
+        memory.write_from_host(bytes)?;
+        Ok(memory)
+    }
+
     /// Take ownership of an existing device allocation.
     ///
     /// This is the explicit boundary used by external memory managers. Runtime
@@ -82,7 +113,7 @@ impl MemOwn {
         byte_len: u64,
         dialect: GpuDialect,
     ) -> Result<Self, MemError> {
-        let gpu = Arc::new(GpuApi::load(dialect)?);
+        let gpu = GpuApi::load(dialect)?;
         // SAFETY: upheld by this function's caller.
         Ok(unsafe { Self::from_raw_parts_with_gpu(data, byte_len, gpu) })
     }
@@ -161,7 +192,7 @@ impl MemOwn {
         }
     }
 
-    pub(super) fn write_from_host(&mut self, bytes: &[u8]) -> Result<(), MemError> {
+    fn write_from_host(&mut self, bytes: &[u8]) -> Result<(), MemError> {
         debug_assert_eq!(self.abi.len, bytes.len() as u64);
         self.gpu.copy_host_to_device(self.abi.data, bytes)
     }
@@ -172,7 +203,7 @@ impl MemOwn {
     ///
     /// The same ownership requirements as [`MemOwn::from_raw_parts`] apply,
     /// and `data` must belong to `gpu`'s dialect.
-    pub(super) unsafe fn from_raw_parts_with_gpu(
+    pub(crate) unsafe fn from_raw_parts_with_gpu(
         data: *mut c_void,
         byte_len: u64,
         gpu: Arc<GpuApi>,
@@ -239,6 +270,11 @@ impl<'a> MemRef<'a> {
     pub fn dialect(&self) -> GpuDialect {
         self.dialect
     }
+}
+
+fn slice_as_bytes<T>(values: &[T]) -> &[u8] {
+    let byte_len = std::mem::size_of_val(values);
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), byte_len) }
 }
 
 fn display_paths(paths: &[PathBuf]) -> String {

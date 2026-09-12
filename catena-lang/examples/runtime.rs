@@ -7,22 +7,33 @@ use catena_lang::{
 };
 
 const GPU_DIALECT_ENV: &str = "CATENA_GPU_DIALECT";
+const ARRAY_HEAD_PLUS_ONE: &str = r#"
+(def program array-head-u64 : ([n.] (cap.ref mem)) -> ([n.] (u64 val)) = (
+  mem.cast.u64
+  {
+    (u64.assert-nz ix.zero)
+    [b]
+  }
+  ix
+  ({_ u64.one} u64.add)
+))
+"#;
 
 fn main() -> anyhow::Result<()> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let runtime = Runtime::new(
-        stdlib::paths_from(&root).chain([root.join("examples/example.hex")]),
-        configured_gpu_dialect()?,
-    )?;
+    let runtime = Runtime::new(configured_gpu_dialect()?)?;
+    let artifact =
+        runtime.load(stdlib::paths_from(&root).chain([root.join("examples/example.hex")]))?;
+    let plus_one = runtime.load_sources(stdlib::sources().chain([ARRAY_HEAD_PLUS_ONE]))?;
 
-    let [result] = runtime.exec("two-times-two", [])?;
+    let [result] = artifact.exec("two-times-two", [])?;
     let Value::U64(result) = result else {
         anyhow::bail!("two-times-two returned non-u64 value: {result:?}");
     };
     println!("two-times-two: {result}");
     anyhow::ensure!(result == 4, "two-times-two returned {result}, expected 4");
 
-    let [] = runtime.exec("require-true", [true.into()])?;
+    let [] = artifact.exec("require-true", [true.into()])?;
 
     // Input values for `array-head-u64`
     let values = [0x123456789abcdef0_u64, 7, 11];
@@ -37,7 +48,8 @@ fn main() -> anyhow::Result<()> {
 
     // Execute array-head-u64 with values above
     let input = runtime.mem_u64(&values)?;
-    let [head] = runtime.exec("array-head-u64", [input.as_ref().into()])?;
+    drop(runtime);
+    let [head] = artifact.exec("array-head-u64", [input.as_ref().into()])?;
     let Value::U64(head) = head else {
         anyhow::bail!("array-head-u64 returned non-u64 value: {head:?}");
     };
@@ -48,6 +60,16 @@ fn main() -> anyhow::Result<()> {
         "array head mismatch: got 0x{head:x}, expected 0x{:x}",
         values[0]
     );
+
+    // Run the second .so's version of the same program with the device
+    // allocation created above.
+    let [head_plus_one] = plus_one.exec("array-head-u64", [input.as_ref().into()])?;
+    let Value::U64(head_plus_one) = head_plus_one else {
+        anyhow::bail!("second array-head-u64 returned non-u64 value: {head_plus_one:?}");
+    };
+    anyhow::ensure!(head_plus_one == values[0] + 1);
+    anyhow::ensure!(input.try_to_u64_vec()? == values);
+    println!("same allocation through second artifact: 0x{head_plus_one:x}");
 
     Ok(())
 }

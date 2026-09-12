@@ -4,7 +4,7 @@
 //!
 //! ```cpp
 //! T *buf_data = nullptr;
-//! catena_host_gpu_check(cudaMallocAsync((void **)&buf_data, len * sizeof(T), nullptr));
+//! catena_host_buffer_allocate((void **)&buf_data, len, sizeof(T));
 //! materialize_kernel<<<dim3((len + 255) / 256), dim3(256)>>>(buf_data, len, env...);
 //! buf = buf_data;
 //! ```
@@ -84,7 +84,6 @@ pub(in crate::codegen) fn render_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
 ) -> Result<(), GpuRenderError> {
     let [output] = assignment.outputs.as_slice() else {
         return Err(invalid_outputs(assignment, 1));
@@ -114,10 +113,9 @@ pub(in crate::codegen) fn render_call(
         name = output.name
     ));
     out.push_str(&format!(
-        "        catena_host_gpu_check({device_alloc_async_fn}((void **)&{name}_data, {name}_len * sizeof({element}), nullptr));\n",
+        "        catena_host_buffer_allocate((void **)&{name}_data, {name}_len, sizeof({element}));\n",
         name = output.name,
         element = c_type(element),
-        device_alloc_async_fn = dialect.device_alloc_async_fn(),
     ));
     out.push_str(&format!(
         "        {kernel_name}<<<dim3(({name}_len + 255) / 256), dim3(256)>>>\n",
@@ -191,7 +189,6 @@ pub(in crate::codegen) fn render_into_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    _dialect: GpuDialect,
 ) -> Result<(), GpuRenderError> {
     let [output] = assignment.outputs.as_slice() else {
         return Err(invalid_outputs(assignment, 1));
@@ -290,7 +287,6 @@ pub(in crate::codegen) fn render_borrow_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
 ) -> Result<(), GpuRenderError> {
     let [cache_output, output] = assignment.outputs.as_slice() else {
         return Err(invalid_outputs(assignment, 2));
@@ -314,8 +310,7 @@ pub(in crate::codegen) fn render_borrow_call(
     ));
     out.push_str(&format!("    if ({}_len != 0) {{\n", output.name));
     out.push_str(&format!(
-        "        catena_host_gpu_check({}((void **)&{}_data, {}_len * sizeof({}), nullptr));\n",
-        dialect.device_alloc_async_fn(),
+        "        catena_host_buffer_allocate((void **)&{}_data, {}_len, sizeof({}));\n",
         output.name,
         output.name,
         c_type(element)
@@ -1650,7 +1645,6 @@ pub(in crate::codegen) fn render_borrow_argmax_f32_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
 ) -> Result<(), GpuRenderError> {
     let [source_output, index_output] = assignment.outputs.as_slice() else {
         return Err(invalid_outputs(assignment, 2));
@@ -1667,8 +1661,7 @@ pub(in crate::codegen) fn render_borrow_argmax_f32_call(
         index_output.name
     ));
     out.push_str(&format!(
-        "    catena_host_gpu_check({}((void **)&{}_data, sizeof(uint64_t), nullptr));\n",
-        dialect.device_alloc_async_fn(),
+        "    catena_host_buffer_allocate((void **)&{}_data, 1, sizeof(uint64_t));\n",
         index_output.name
     ));
     out.push_str(&format!(
@@ -1797,7 +1790,6 @@ pub(in crate::codegen) fn render_borrow_topk_f32_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
 ) -> Result<(), GpuRenderError> {
     let [source_output, index_output] = assignment.outputs.as_slice() else {
         return Err(invalid_outputs(assignment, 2));
@@ -1812,6 +1804,7 @@ pub(in crate::codegen) fn render_borrow_topk_f32_call(
 
     out.push_str(&format!("    catena_assert(({columns}) != 0);\n"));
     out.push_str(&format!("    catena_assert(({k}) != 0 && ({k}) <= 8);\n"));
+    out.push_str(&format!("    catena_assert(({k}) <= ({columns}));\n"));
     out.push_str(&format!(
         "    catena_assert(({len}) % ({columns}) == 0 && ({rows}) == ({len}) / ({columns}));\n"
     ));
@@ -1827,8 +1820,7 @@ pub(in crate::codegen) fn render_borrow_topk_f32_call(
     ));
     out.push_str(&format!("    if (({output_len}) != 0) {{\n"));
     out.push_str(&format!(
-        "        catena_host_gpu_check({}((void **)&{}_data, ({output_len}) * sizeof(uint64_t), nullptr));\n",
-        dialect.device_alloc_async_fn(),
+        "        catena_host_buffer_allocate((void **)&{}_data, {output_len}, sizeof(uint64_t));\n",
         index_output.name
     ));
     out.push_str(&format!(
@@ -1851,7 +1843,6 @@ pub(in crate::codegen) fn render_borrow_reduce_f32_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
 ) -> Result<(), GpuRenderError> {
     let [cache_output, output] = assignment.outputs.as_slice() else {
         return Err(invalid_outputs(assignment, 2));
@@ -1873,8 +1864,7 @@ pub(in crate::codegen) fn render_borrow_reduce_f32_call(
     out.push_str(&format!("    catena_assert(({reduction_len}) <= 16384);\n"));
     out.push_str(&format!("    if ({}_len != 0) {{\n", output.name));
     out.push_str(&format!(
-        "        catena_host_gpu_check({}((void **)&{}_data, {}_len * sizeof({}), nullptr));\n",
-        dialect.device_alloc_async_fn(),
+        "        catena_host_buffer_allocate((void **)&{}_data, {}_len, sizeof({}));\n",
         output.name,
         output.name,
         c_type(output_element)
@@ -1908,7 +1898,6 @@ pub(in crate::codegen) fn render_borrow_routed_bf16_gemv_pair_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
 ) -> Result<(), GpuRenderError> {
     let [input_output, selected_output, gate_output, up_output] = assignment.outputs.as_slice()
     else {
@@ -1985,13 +1974,11 @@ pub(in crate::codegen) fn render_borrow_routed_bf16_gemv_pair_call(
     ));
     out.push_str(&format!("    if (({output_len}) != 0) {{\n"));
     out.push_str(&format!(
-        "        catena_host_gpu_check({}((void **)&{}_data, ({output_len}) * sizeof(float), nullptr));\n",
-        dialect.device_alloc_async_fn(),
+        "        catena_host_buffer_allocate((void **)&{}_data, {output_len}, sizeof(float));\n",
         gate_output.name
     ));
     out.push_str(&format!(
-        "        catena_host_gpu_check({}((void **)&{}_data, ({output_len}) * sizeof(float), nullptr));\n",
-        dialect.device_alloc_async_fn(),
+        "        catena_host_buffer_allocate((void **)&{}_data, {output_len}, sizeof(float));\n",
         up_output.name
     ));
     out.push_str(&format!(
@@ -2029,7 +2016,7 @@ pub(in crate::codegen) fn render_borrow_native_bf16_gemm_pair_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
+    _dialect: GpuDialect,
     backend: NativeBf16PairBackend,
 ) -> Result<(), GpuRenderError> {
     let [input_output, gate_output, up_output] = assignment.outputs.as_slice() else {
@@ -2087,9 +2074,8 @@ pub(in crate::codegen) fn render_borrow_native_bf16_gemm_pair_call(
     out.push_str(&format!("    if (({output_len}) != 0) {{\n"));
     for output in [gate_output, up_output] {
         out.push_str(&format!(
-            "        catena_host_gpu_check({}((void **)&{}_data, ({output_len}) * sizeof(catena_bf16_t), nullptr));\n",
-            dialect.device_alloc_async_fn(),
-            output.name
+            "        catena_host_buffer_allocate((void **)&{}_data, ({output_len}), sizeof(catena_bf16_t));\n",
+                        output.name
         ));
     }
     match backend {
@@ -2225,7 +2211,7 @@ pub(in crate::codegen) fn render_borrow_routed_native_bf16_gemv_pair_call(
     ));
     out.push_str(&format!("    if (({output_len}) != 0) {{\n"));
     for output in [gate_output, up_output] {
-        out.push_str(&format!("        catena_host_gpu_check({}((void **)&{}_data, ({output_len}) * sizeof(catena_bf16_t), nullptr));\n", dialect.device_alloc_async_fn(), output.name));
+        out.push_str(&format!("        catena_host_buffer_allocate((void **)&{}_data, ({output_len}), sizeof(catena_bf16_t));\n", output.name));
     }
     let simt_kernel_name = match backend {
         RoutedNativeBf16PairBackend::Simt => kernel_name.clone(),
@@ -2242,15 +2228,13 @@ pub(in crate::codegen) fn render_borrow_routed_native_bf16_gemv_pair_call(
     );
     if backend == RoutedNativeBf16PairBackend::Wmma && dialect == GpuDialect::Hip {
         out.push_str(&format!(
-            "        if ({prefix}_expert_count != 0 && {prefix}_expert_count <= 256 && ({selected_capacity}) >= {prefix}_expert_count * 16 && (({reduction_len}) & 15) == 0 && (({output_features}) & 15) == 0) {{\n            uint64_t *{prefix}_offsets = nullptr;\n            uint64_t *{prefix}_permutation = nullptr;\n            catena_host_gpu_check({alloc}((void **)&{prefix}_offsets, ({prefix}_expert_count + 1) * sizeof(uint64_t), nullptr));\n            catena_host_gpu_check({alloc}((void **)&{prefix}_permutation, ({selected_capacity}) * sizeof(uint64_t), nullptr));\n            {kernel_name}_group<<<dim3(1), dim3(256)>>>(\n                {}, {selected_capacity}, {prefix}_expert_count, {prefix}_offsets, {prefix}_permutation);\n            {kernel_name}<<<dim3((({output_features}) + 15) / 16, {prefix}_expert_count), dim3(32)>>>(\n                {}, {}, {}, {prefix}_offsets, {prefix}_permutation, {}_data, {}_data, {reduction_len}, {slots}, {output_features});\n            catena_host_gpu_check({free}({prefix}_offsets, nullptr));\n            catena_host_gpu_check({free}({prefix}_permutation, nullptr));\n        }} else {{\n{simt_call}        }}\n",
+            "        if ({prefix}_expert_count != 0 && {prefix}_expert_count <= 256 && ({selected_capacity}) >= {prefix}_expert_count * 16 && (({reduction_len}) & 15) == 0 && (({output_features}) & 15) == 0) {{\n            uint64_t *{prefix}_offsets = nullptr;\n            uint64_t *{prefix}_permutation = nullptr;\n            catena_host_buffer_allocate((void **)&{prefix}_offsets, ({prefix}_expert_count + 1), sizeof(uint64_t));\n            catena_host_buffer_allocate((void **)&{prefix}_permutation, ({selected_capacity}), sizeof(uint64_t));\n            {kernel_name}_group<<<dim3(1), dim3(256)>>>(\n                {}, {selected_capacity}, {prefix}_expert_count, {prefix}_offsets, {prefix}_permutation);\n            {kernel_name}<<<dim3((({output_features}) + 15) / 16, {prefix}_expert_count), dim3(32)>>>(\n                {}, {}, {}, {prefix}_offsets, {prefix}_permutation, {}_data, {}_data, {reduction_len}, {slots}, {output_features});\n            catena_host_buffer_free({prefix}_offsets);\n            catena_host_buffer_free({prefix}_permutation);\n        }} else {{\n{simt_call}        }}\n",
             value_expr(selected),
             value_expr(input),
             value_expr(gate_weight),
             value_expr(up_weight),
             gate_output.name,
             up_output.name,
-            alloc = dialect.device_alloc_async_fn(),
-            free = dialect.device_free_async_fn(),
         ));
     } else {
         out.push_str(&simt_call);
@@ -2342,7 +2326,7 @@ pub(in crate::codegen) fn render_borrow_routed_native_bf16_gemv_residual_call(
         "    catena_bf16_t *{}_data = nullptr;\n",
         output.name
     ));
-    out.push_str(&format!("    if (({output_len}) != 0) {{\n        catena_host_gpu_check({}((void **)&{}_data, ({output_len}) * sizeof(catena_bf16_t), nullptr));\n", dialect.device_alloc_async_fn(), output.name));
+    out.push_str(&format!("    if (({output_len}) != 0) {{\n        catena_host_buffer_allocate((void **)&{}_data, ({output_len}), sizeof(catena_bf16_t));\n", output.name));
     let simt_kernel_name = match backend {
         RoutedNativeBf16ResidualBackend::Simt => kernel_name.clone(),
         RoutedNativeBf16ResidualBackend::Wmma => format!("{kernel_name}_simt"),
@@ -2357,14 +2341,12 @@ pub(in crate::codegen) fn render_borrow_routed_native_bf16_gemv_residual_call(
     );
     if backend == RoutedNativeBf16ResidualBackend::Wmma && dialect == GpuDialect::Hip {
         out.push_str(&format!(
-            "        if ({prefix}_expert_count != 0 && {prefix}_expert_count <= 256 && ({selected_capacity}) >= {prefix}_expert_count * 16 && (({intermediate}) & 15) == 0 && (({output_features}) & 15) == 0) {{\n            uint64_t *{prefix}_offsets = nullptr;\n            uint64_t *{prefix}_permutation = nullptr;\n            float *{prefix}_route_output = nullptr;\n            uint64_t {prefix}_route_output_len = ({selected_capacity}) * ({output_features});\n            catena_host_gpu_check({alloc}((void **)&{prefix}_offsets, ({prefix}_expert_count + 1) * sizeof(uint64_t), nullptr));\n            catena_host_gpu_check({alloc}((void **)&{prefix}_permutation, ({selected_capacity}) * sizeof(uint64_t), nullptr));\n            catena_host_gpu_check({alloc}((void **)&{prefix}_route_output, {prefix}_route_output_len * sizeof(float), nullptr));\n            {kernel_name}_group<<<dim3(1), dim3(256)>>>(\n                {}, {selected_capacity}, {prefix}_expert_count, {prefix}_offsets, {prefix}_permutation);\n            {kernel_name}<<<dim3((({output_features}) + 15) / 16, {prefix}_expert_count), dim3(32)>>>(\n                {}, {}, {prefix}_offsets, {prefix}_permutation, {prefix}_route_output, {intermediate}, {output_features});\n            {kernel_name}_combine<<<dim3((({output_len}) + 255) / 256), dim3(256)>>>(\n                {prefix}_route_output, {}, {}_data, {output_len}, {slots}, {output_features});\n            catena_host_gpu_check({free}({prefix}_offsets, nullptr));\n            catena_host_gpu_check({free}({prefix}_permutation, nullptr));\n            catena_host_gpu_check({free}({prefix}_route_output, nullptr));\n        }} else {{\n{simt_call}        }}\n",
+            "        if ({prefix}_expert_count != 0 && {prefix}_expert_count <= 256 && ({selected_capacity}) >= {prefix}_expert_count * 16 && (({intermediate}) & 15) == 0 && (({output_features}) & 15) == 0) {{\n            uint64_t *{prefix}_offsets = nullptr;\n            uint64_t *{prefix}_permutation = nullptr;\n            float *{prefix}_route_output = nullptr;\n            uint64_t {prefix}_route_output_len = ({selected_capacity}) * ({output_features});\n            catena_host_buffer_allocate((void **)&{prefix}_offsets, ({prefix}_expert_count + 1), sizeof(uint64_t));\n            catena_host_buffer_allocate((void **)&{prefix}_permutation, ({selected_capacity}), sizeof(uint64_t));\n            catena_host_buffer_allocate((void **)&{prefix}_route_output, {prefix}_route_output_len, sizeof(float));\n            {kernel_name}_group<<<dim3(1), dim3(256)>>>(\n                {}, {selected_capacity}, {prefix}_expert_count, {prefix}_offsets, {prefix}_permutation);\n            {kernel_name}<<<dim3((({output_features}) + 15) / 16, {prefix}_expert_count), dim3(32)>>>(\n                {}, {}, {prefix}_offsets, {prefix}_permutation, {prefix}_route_output, {intermediate}, {output_features});\n            {kernel_name}_combine<<<dim3((({output_len}) + 255) / 256), dim3(256)>>>(\n                {prefix}_route_output, {}, {}_data, {output_len}, {slots}, {output_features});\n            catena_host_buffer_free({prefix}_offsets);\n            catena_host_buffer_free({prefix}_permutation);\n            catena_host_buffer_free({prefix}_route_output);\n        }} else {{\n{simt_call}        }}\n",
             value_expr(selected),
             value_expr(active),
             value_expr(down),
             value_expr(residual),
             output.name,
-            alloc = dialect.device_alloc_async_fn(),
-            free = dialect.device_free_async_fn(),
         ));
     } else {
         out.push_str(&simt_call);
@@ -2388,7 +2370,7 @@ pub(in crate::codegen) fn render_bf16_gemv_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
+    _dialect: GpuDialect,
 ) -> Result<(), GpuRenderError> {
     let [output] = assignment.outputs.as_slice() else {
         return Err(invalid_outputs(assignment, 1));
@@ -2447,9 +2429,8 @@ pub(in crate::codegen) fn render_bf16_gemv_call(
         name = output.name
     ));
     out.push_str(&format!(
-        "        catena_host_gpu_check({}((void **)&{name}_data, {name}_len * sizeof(catena_bf16_t), nullptr));\n",
-        dialect.device_alloc_async_fn(),
-        name = output.name
+        "        catena_host_buffer_allocate((void **)&{name}_data, {name}_len, sizeof(catena_bf16_t));\n",
+                name = output.name
     ));
     out.push_str(&format!(
         "        {kernel_name}<<<dim3({name}_len), dim3(256)>>>(\n            {}, {}, {name}_data, {name}_len, {reduction_len}, {input_row}, {output_features});\n",
@@ -2466,7 +2447,7 @@ pub(in crate::codegen) fn render_bf16_gemm_wmma_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
+    _dialect: GpuDialect,
 ) -> Result<(), GpuRenderError> {
     let [output] = assignment.outputs.as_slice() else {
         return Err(invalid_outputs(assignment, 1));
@@ -2494,7 +2475,7 @@ pub(in crate::codegen) fn render_bf16_gemm_wmma_call(
     ));
     out.push_str(&format!("    catena_assert(({reduction_len}) != 0);\n    catena_assert(({input_capacity}) % ({reduction_len}) == 0);\n    uint64_t {name}_input_rows = ({input_capacity}) / ({reduction_len});\n    catena_assert(({output_features}) != 0);\n    catena_assert({name}_len % ({output_features}) == 0);\n    uint64_t {name}_rows = {name}_len / ({output_features});\n"));
     out.push_str(&format!("    catena_assert(({input_row}) <= {name}_input_rows && {name}_rows <= {name}_input_rows - ({input_row}));\n    catena_assert(({output_features}) <= UINT64_MAX / ({reduction_len}));\n    catena_assert(({weight_capacity}) == ({output_features}) * ({reduction_len}));\n"));
-    out.push_str(&format!("    if ({name}_len != 0) {{\n        catena_host_gpu_check({}((void **)&{name}_data, {name}_len * sizeof(catena_bf16_t), nullptr));\n", dialect.device_alloc_async_fn()));
+    out.push_str(&format!("    if ({name}_len != 0) {{\n        catena_host_buffer_allocate((void **)&{name}_data, {name}_len, sizeof(catena_bf16_t));\n"));
     out.push_str(&format!("        if ({name}_rows >= 64) {{\n            {kernel_name}<<<dim3((({output_features}) + 15) / 16, ({name}_rows + 15) / 16), dim3(32)>>>(\n                {}, {}, {name}_data, {name}_rows, {reduction_len}, {input_row}, {output_features});\n        }} else\n", value_expr(input), value_expr(weight)));
     out.push_str(&format!("        {{\n            {kernel_name}_simt<<<dim3({name}_len), dim3(256)>>>(\n                {}, {}, {name}_data, {name}_len, {reduction_len}, {input_row}, {output_features});\n        }}\n    }}\n    {name} = {name}_data;\n", value_expr(input), value_expr(weight)));
     Ok(())
@@ -2504,7 +2485,7 @@ pub(in crate::codegen) fn render_bf16_gemm_blas_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
+    _dialect: GpuDialect,
 ) -> Result<(), GpuRenderError> {
     let [output] = assignment.outputs.as_slice() else {
         return Err(invalid_outputs(assignment, 1));
@@ -2535,7 +2516,7 @@ pub(in crate::codegen) fn render_bf16_gemm_blas_call(
     catena_assert(({output_features}) <= UINT64_MAX / ({reduction_len}));
     catena_assert(({weight_capacity}) == ({output_features}) * ({reduction_len}));
     if ({name}_len != 0) {{
-        catena_host_gpu_check({device_alloc}((void **)&{name}_data, {name}_len * sizeof(catena_bf16_t), nullptr));
+        catena_host_buffer_allocate((void **)&{name}_data, {name}_len, sizeof(catena_bf16_t));
         if ({name}_rows >= 64) {{
             catena_assert(({output_features}) <= INT32_MAX && {name}_rows <= INT32_MAX && ({reduction_len}) <= INT32_MAX);
             const float {name}_alpha = 1.0f;
@@ -2559,7 +2540,6 @@ pub(in crate::codegen) fn render_bf16_gemm_blas_call(
         reduction_len = value_expr(reduction_len),
         input_row = value_expr(input_row),
         output_features = value_expr(output_features),
-        device_alloc = dialect.device_alloc_async_fn(),
     ));
     Ok(())
 }
@@ -2568,7 +2548,6 @@ pub(in crate::codegen) fn render_reduce_f32_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
 ) -> Result<(), GpuRenderError> {
     let [output] = assignment.outputs.as_slice() else {
         return Err(invalid_outputs(assignment, 1));
@@ -2590,8 +2569,7 @@ pub(in crate::codegen) fn render_reduce_f32_call(
     out.push_str(&format!("    catena_assert(({reduction_len}) <= 16384);\n"));
     out.push_str(&format!("    if ({}_len != 0) {{\n", output.name));
     out.push_str(&format!(
-        "        catena_host_gpu_check({}((void **)&{}_data, {}_len * sizeof({}), nullptr));\n",
-        dialect.device_alloc_async_fn(),
+        "        catena_host_buffer_allocate((void **)&{}_data, {}_len, sizeof({}));\n",
         output.name,
         output.name,
         c_type(output_element)
@@ -2616,7 +2594,6 @@ pub(in crate::codegen) fn render_reduce_f32_pair_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
 ) -> Result<(), GpuRenderError> {
     let [left_output, right_output] = assignment.outputs.as_slice() else {
         return Err(invalid_outputs(assignment, 2));
@@ -2636,8 +2613,7 @@ pub(in crate::codegen) fn render_reduce_f32_pair_call(
     out.push_str(&format!("    if ({output_len} != 0) {{\n"));
     for output in [left_output, right_output] {
         out.push_str(&format!(
-            "        catena_host_gpu_check({}((void **)&{}_data, ({output_len}) * sizeof(float), nullptr));\n",
-            dialect.device_alloc_async_fn(),
+            "        catena_host_buffer_allocate((void **)&{}_data, {output_len}, sizeof(float));\n",
             output.name
         ));
     }

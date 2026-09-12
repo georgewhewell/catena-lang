@@ -186,7 +186,7 @@ pub(in crate::codegen) fn render_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
+    _dialect: GpuDialect,
     storage: StorageType,
 ) -> Result<(), GpuRenderError> {
     let p = parts(assignment)?;
@@ -235,7 +235,7 @@ pub(in crate::codegen) fn render_call(
         storage_type = storage.c_type(),
         tokens = e(13)
     ));
-    out.push_str(&format!("        catena_host_gpu_check({alloc}((void **)&{result}_data, ({tokens}) * ({vh}) * ({dim}) * sizeof({storage_type}), nullptr));\n", alloc=dialect.device_alloc_async_fn(), tokens=e(13), vh=e(15), dim=e(16), storage_type=storage.c_type()));
+    out.push_str(&format!("        catena_host_buffer_allocate((void **)&{result}_data, ({tokens}) * ({vh}) * ({dim}), sizeof({storage_type}));\n", tokens=e(13), vh=e(15), dim=e(16), storage_type=storage.c_type()));
     out.push_str(&format!("        dim3 block(({dim}) < 32 ? ({dim}) : 32, 4);\n        dim3 grid(({vh}), 1, (({dim}) + 3) / 4);\n", dim=e(16), vh=e(15)));
     out.push_str(&format!("        {name}<<<grid, block>>>({state}, {off}, {q}, {k}, {v}, {gate}, {beta}, {result}_data, {tokens}, {kh}, {vh}, {dim});\n    }}\n", state=e(0), off=e(12), q=e(2), k=e(4), v=e(6), gate=e(8), beta=e(10), tokens=e(13), kh=e(14), vh=e(15), dim=e(16)));
     for (i, input_index) in [0usize, 2, 4, 6, 8, 10].iter().enumerate() {

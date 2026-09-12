@@ -150,7 +150,7 @@ pub(in crate::codegen) fn render_call(
     out: &mut String,
     function: &GpuFunction,
     assignment: &GpuAssign,
-    dialect: GpuDialect,
+    _dialect: GpuDialect,
     storage: StorageType,
 ) -> Result<(), GpuRenderError> {
     let p = parts(assignment)?;
@@ -243,8 +243,7 @@ pub(in crate::codegen) fn render_call(
         outcap = e(4)
     ));
     out.push_str(&format!(
-        "        catena_host_gpu_check({alloc}((void **)&{output}_data, ({outcap}) * sizeof({element}), nullptr));\n",
-        alloc = dialect.device_alloc_async_fn(),
+        "        catena_host_buffer_allocate((void **)&{output}_data, ({outcap}), sizeof({element}));\n",
         outcap = e(4)
     ));
     out.push_str(&format!(

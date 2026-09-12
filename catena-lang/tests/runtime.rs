@@ -1,22 +1,56 @@
 use catena_lang::{
     codegen::GpuDialect,
-    runtime::{InitError, MemRef, Runtime, Value, ValueKind},
+    runtime::{Artifact, ExecError, InitError, MemError, MemRef, Runtime, Value, ValueKind},
     stdlib,
 };
+use std::ops::Deref;
 
 const GPU_DIALECT_ENV: &str = "CATENA_GPU_DIALECT";
 
 /// Create a runtime with a provided user source file
-fn runtime_with(source: &'static str) -> anyhow::Result<Runtime> {
-    Runtime::from_sources(stdlib::sources().chain([source]), configured_gpu_dialect()?)
-        .map_err(Into::into)
+fn runtime_with(source: &'static str) -> anyhow::Result<TestRuntime> {
+    let runtime = Runtime::new(configured_gpu_dialect()?)?;
+    let artifact = runtime.load_sources(stdlib::sources().chain([source]))?;
+    Ok(TestRuntime { runtime, artifact })
 }
 
 fn runtime_with_sources(
     sources: impl IntoIterator<Item = &'static str>,
-) -> anyhow::Result<Runtime> {
-    Runtime::from_sources(stdlib::sources().chain(sources), configured_gpu_dialect()?)
-        .map_err(Into::into)
+) -> anyhow::Result<TestRuntime> {
+    let runtime = Runtime::new(configured_gpu_dialect()?)?;
+    let artifact = runtime.load_sources(stdlib::sources().chain(sources))?;
+    Ok(TestRuntime { runtime, artifact })
+}
+
+struct TestRuntime {
+    runtime: Runtime,
+    artifact: Artifact,
+}
+
+impl TestRuntime {
+    fn exec<'a, const M: usize, const N: usize>(
+        &self,
+        name: &str,
+        args: [Value<'a>; M],
+    ) -> Result<[Value<'static>; N], ExecError> {
+        self.artifact.exec(name, args)
+    }
+
+    fn exec_values<'a>(
+        &self,
+        name: &str,
+        args: Vec<Value<'a>>,
+    ) -> Result<Vec<Value<'static>>, ExecError> {
+        self.artifact.exec_values(name, args)
+    }
+}
+
+impl Deref for TestRuntime {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
 }
 
 fn configured_gpu_dialect() -> anyhow::Result<GpuDialect> {
@@ -31,6 +65,100 @@ fn configured_gpu_dialect() -> anyhow::Result<GpuDialect> {
             value
         ),
     }
+}
+
+#[test]
+fn runtime_can_be_created_without_sources() -> anyhow::Result<()> {
+    let _runtime = Runtime::new(configured_gpu_dialect()?)?;
+    Ok(())
+}
+
+#[test]
+fn zeroed_f32_memory_handles_empty_allocations() -> anyhow::Result<()> {
+    let runtime = Runtime::new(configured_gpu_dialect()?)?;
+    let memory = runtime.mem_f32_zeroed(0)?;
+
+    assert_eq!(memory.byte_len(), 0);
+    assert!(memory.as_ptr().is_null());
+    assert!(memory.to_f32_vec().is_empty());
+    Ok(())
+}
+
+#[test]
+fn zeroed_f32_memory_contains_positive_zero_bits() -> anyhow::Result<()> {
+    let runtime = Runtime::new(configured_gpu_dialect()?)?;
+    let memory = runtime.mem_f32_zeroed(4)?;
+
+    assert_eq!(memory.byte_len(), 4 * std::mem::size_of::<f32>() as u64);
+    assert_eq!(
+        memory
+            .to_f32_vec()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>(),
+        vec![0; 4]
+    );
+    Ok(())
+}
+
+#[test]
+fn zeroed_f32_memory_rejects_allocation_size_overflow() -> anyhow::Result<()> {
+    let runtime = Runtime::new(configured_gpu_dialect()?)?;
+    let error = runtime.mem_f32_zeroed(usize::MAX).unwrap_err();
+
+    assert!(matches!(
+        error,
+        MemError::AllocationSizeOverflow {
+            element_count: usize::MAX,
+            element_size: 4,
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn multiple_artifacts_resolve_same_function_independently() -> anyhow::Result<()> {
+    const IDENTITY: &str = "(def program inspect : (u64 val) -> (u64 val) = [value])";
+    const ADD_ONE: &str = r#"
+    (def program inspect : (u64 val) -> (u64 val) = ({_ u64.one} u64.add))
+    "#;
+
+    let dialect = configured_gpu_dialect()?;
+    let runtime = Runtime::new(dialect)?;
+    let identity = runtime.load_sources(stdlib::sources().chain([IDENTITY]))?;
+    let add_one = runtime.load_sources(stdlib::sources().chain([ADD_ONE]))?;
+
+    let [first] = identity.exec("inspect", [41_u64.into()])?;
+    let [second] = add_one.exec("inspect", [41_u64.into()])?;
+    assert!(matches!(first, Value::U64(41)));
+    assert!(matches!(second, Value::U64(42)));
+
+    drop(runtime);
+    drop(add_one);
+    let [after_runtime_drop] = identity.exec("inspect", [41_u64.into()])?;
+    assert!(matches!(after_runtime_drop, Value::U64(41)));
+    Ok(())
+}
+
+#[test]
+fn artifact_executes_gpu_work_after_runtime_drop() -> anyhow::Result<()> {
+    let runtime = Runtime::new(configured_gpu_dialect()?)?;
+    let artifact = runtime.load_sources(stdlib::sources())?;
+    drop(runtime);
+
+    let [result] = artifact.exec("tensor.arange-f32", [3_u64.into()])?;
+    let Value::MemOwn(result) = result else {
+        anyhow::bail!("tensor.arange-f32 returned non-owned memory");
+    };
+    assert_eq!(result.try_to_f32_vec()?, [0.0, 1.0, 2.0]);
+    let outputs = artifact.exec_values("tensor.arange-f32", vec![2_u64.into()])?;
+    let [Value::MemOwn(second)] = outputs.as_slice() else {
+        anyhow::bail!("dynamic tensor.arange-f32 returned unexpected values");
+    };
+    assert_eq!(second.try_to_f32_vec()?, [0.0, 1.0]);
+    drop(artifact);
+    assert_eq!(result.try_to_f32_vec()?, [0.0, 1.0, 2.0]);
+    Ok(())
 }
 
 #[test]
@@ -807,6 +935,23 @@ fn mem_own_identity_transfers_and_returns_owned_memory_regression() -> anyhow::R
         "#,
     )?;
 
+    let borrowed = runtime
+        .artifact
+        .entry_points()
+        .iter()
+        .find(|entry| entry.name() == "array-head-u64-ref")
+        .expect("loaded entry point");
+    assert_eq!(borrowed.inputs(), &[ValueKind::MemRef]);
+    assert_eq!(borrowed.outputs(), &[ValueKind::U64]);
+    let owned = runtime
+        .artifact
+        .entry_points()
+        .iter()
+        .find(|entry| entry.name() == "mem-own-identity")
+        .expect("loaded entry point");
+    assert_eq!(owned.inputs(), &[ValueKind::MemOwn]);
+    assert_eq!(owned.outputs(), &[ValueKind::MemOwn]);
+
     let expected = [3_u64, 5, 8, 13];
     let input = runtime.mem_u64(&expected)?;
     let [output] = runtime.exec("mem-own-identity", [input.into()])?;
@@ -823,12 +968,10 @@ fn mem_own_identity_transfers_and_returns_owned_memory_regression() -> anyhow::R
 
 #[test]
 fn cap_ref_outputs_are_rejected_during_initialization() -> anyhow::Result<()> {
-    let result = Runtime::from_sources(
-        stdlib::sources().chain([r#"
+    let runtime = Runtime::new(configured_gpu_dialect()?)?;
+    let result = runtime.load_sources(stdlib::sources().chain([r#"
         (def program mem-ref-identity : (cap.ref mem) -> (cap.ref mem) = [memory])
-        "#]),
-        configured_gpu_dialect()?,
-    );
+        "#]));
 
     assert!(matches!(
         result,

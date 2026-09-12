@@ -10,33 +10,48 @@ use libloading::Library;
 use libloading::os::unix::{Library as UnixLibrary, RTLD_LAZY, RTLD_LOCAL};
 use serde::{Deserialize, Serialize};
 
-use super::artifact::{Artifact, ArtifactError};
+use super::artifact::{ArtifactError, SharedObject};
 use super::executor::{AbiValue, Executor, ExecutorError};
-use super::gpu_api::GpuApi;
 use super::mem::{MemError, MemOwn};
+#[cfg(feature = "experimental-catena-gpu")]
+use super::signature::{GeneratedFunction, generated_signatures};
 use super::{
-    signature::{FunctionSignature, SignatureTable, signatures},
+    signature::{EntryPoint, FunctionSignature, SignatureTable, entry_points, signatures},
     value::{Value, ValueKind},
 };
 use crate::codegen::{GpuDialect, gpu::GpuRenderError, gpu::render_modules};
 use crate::compile::CompileFailure;
+use crate::gpu::GpuApi;
 use metacat::theory::RawTheorySet;
 
-/// Run catena programs with the C backend
+/// A process-local GPU context for compiling artifacts and allocating memory.
 #[derive(Debug)]
 pub struct Runtime {
-    // Keep the tempdir-backed shared object alive for as long as the library is loaded.
-    _artifact: Artifact,
-    /// Prepared entry points in the loaded shared object.
-    executor: Executor,
     /// GPU operations used to validate and release memory crossing the ABI.
     gpu: Arc<GpuApi>,
+}
+
+/// A compiled Catena program executable in this process.
+///
+/// It owns its execution state and remains usable after its [`Runtime`] is
+/// dropped. Native code remains mapped until process exit.
+#[derive(Debug)]
+pub struct Artifact {
+    /// GPU operations used to validate and release memory crossing the ABI.
+    gpu: Arc<GpuApi>,
+    entry_points: Vec<EntryPoint>,
+    // Keep the tempdir-backed shared object alive for as long as the library is loaded.
+    _shared_object: SharedObject,
+    /// Prepared entry points in the loaded shared object.
+    executor: Executor,
     /// Function signatures (runtime Rust ↔ C typechecking)
     signatures: SignatureTable,
 }
 
 #[derive(Debug, Error)]
 pub enum InitError {
+    #[error("no usable GPU backend (CUDA: {cuda}; HIP: {hip})")]
+    NoBackend { cuda: String, hip: String },
     #[error("Failed to parse program: {0}")]
     Parse(#[from] metacat::theory::ast::ParseRawError),
     #[error(transparent)]
@@ -105,33 +120,61 @@ pub enum ExecError {
     },
     #[error("Argument {index} contains device memory from a different GPU dialect")]
     IncompatibleDeviceMemory { index: usize },
+    #[error("artifact does not provide generated-device-allocation controls")]
+    AllocationBudgetUnavailable,
     #[error("GPU execution failed while synchronizing: {0}")]
     GpuSynchronization(String),
 }
 
 impl Runtime {
-    /// Construct a new runtime from a list of paths, interpreted as catena programs (&stdlib)
-    pub fn new<I>(paths: I, dialect: GpuDialect) -> Result<Runtime, InitError>
+    /// Select a provider-local runtime. Auto probes CUDA before HIP, and
+    /// reports both failures if neither has a usable device.
+    pub fn with_backend(backend: super::Backend) -> Result<Self, InitError> {
+        if let Some(dialect) = backend.dialect() {
+            return Self::new(dialect);
+        }
+        Self::new(GpuDialect::Cuda).or_else(|cuda| {
+            Self::new(GpuDialect::Hip).map_err(|hip| InitError::NoBackend {
+                cuda: cuda.to_string(),
+                hip: hip.to_string(),
+            })
+        })
+    }
+
+    pub fn dialect(&self) -> GpuDialect {
+        self.gpu.dialect()
+    }
+    pub(crate) fn gpu_api(&self) -> Arc<GpuApi> {
+        self.gpu.clone()
+    }
+
+    /// Construct an empty runtime for the selected GPU dialect.
+    pub fn new(dialect: GpuDialect) -> Result<Runtime, InitError> {
+        Ok(Self {
+            gpu: GpuApi::load(dialect)?,
+        })
+    }
+
+    /// Compile Catena programs from paths into a new artifact.
+    pub fn load<I>(&self, paths: I) -> Result<Artifact, InitError>
     where
         I: IntoIterator<Item = PathBuf>,
     {
         let raw_theories = metacat::theory::RawTheorySet::from_files(paths)?;
-        Self::from_raw_theories(raw_theories, dialect)
+        self.load_raw_theories(raw_theories)
     }
 
-    /// Construct a new runtime from in-memory Catena source strings.
-    pub fn from_sources<'a, I>(sources: I, dialect: GpuDialect) -> Result<Runtime, InitError>
+    /// Compile in-memory Catena source strings into a new artifact.
+    pub fn load_sources<'a, I>(&self, sources: I) -> Result<Artifact, InitError>
     where
         I: IntoIterator<Item = &'a str>,
     {
         let raw_theories = RawTheorySet::from_texts(sources)?;
-        Self::from_raw_theories(raw_theories, dialect)
+        self.load_raw_theories(raw_theories)
     }
 
-    fn from_raw_theories(
-        raw_theories: RawTheorySet,
-        dialect: GpuDialect,
-    ) -> Result<Runtime, InitError> {
+    fn load_raw_theories(&self, raw_theories: RawTheorySet) -> Result<Artifact, InitError> {
+        let dialect = self.gpu.dialect();
         let report = crate::compile::compile(raw_theories)?;
         let modules = report
             .gpu_modules
@@ -156,47 +199,96 @@ impl Runtime {
             path: cpp_path.clone(),
             source,
         })?;
-        let artifact = super::artifact::compile(&cpp_path, dialect)?;
+        let shared_object = super::artifact::compile(&cpp_path, dialect)?;
 
-        let library = load_generated_library(artifact.path())?;
+        let library = load_generated_library(shared_object.path())?;
         let executor = Executor::new(library, &signature_table).map_err(|error| match error {
             ExecutorError::LoadSymbol { symbol, source } => {
                 InitError::LoadSymbol { symbol, source }
             }
         })?;
-        let gpu = Arc::new(GpuApi::load(dialect)?);
-
-        Ok(Self {
-            _artifact: artifact,
+        Ok(Artifact {
+            gpu: self.gpu.clone(),
+            entry_points: entry_points(&signature_table),
+            _shared_object: shared_object,
             executor,
-            gpu,
             signatures: signature_table,
         })
     }
 
+    /// Compile and load generated GPU source with its public entry-point ABI.
+    ///
+    /// This lets another Catena compiler reuse the runtime without depending on
+    /// catena-lang's compiler or code-generation representation. External
+    /// source is not instrumented for generated-device-allocation budgets.
+    #[cfg(feature = "experimental-catena-gpu")]
+    pub fn load_generated_source(
+        &self,
+        source: &str,
+        functions: impl IntoIterator<Item = GeneratedFunction>,
+    ) -> Result<Artifact, InitError> {
+        self.load_generated(source, generated_signatures(functions))
+    }
+
+    #[cfg(feature = "experimental-catena-gpu")]
+    fn load_generated(
+        &self,
+        source: &str,
+        signature_table: SignatureTable,
+    ) -> Result<Artifact, InitError> {
+        let dialect = self.gpu.dialect();
+        if let Some((name, index)) = ref_output(&signature_table) {
+            return Err(InitError::UnsupportedRefOutput { name, index });
+        }
+
+        let report_dir = tempfile::Builder::new()
+            .prefix("catena-report-")
+            .tempdir()
+            .map_err(|source| InitError::CreateBuildDir {
+                path: std::env::temp_dir(),
+                source,
+            })?;
+        let cpp_path = report_dir.path().join("module.cpp");
+        fs::write(&cpp_path, source).map_err(|source| InitError::WriteGeneratedSource {
+            path: cpp_path.clone(),
+            source,
+        })?;
+        let shared_object = super::artifact::compile(&cpp_path, dialect)?;
+
+        let library = load_generated_library(shared_object.path())?;
+        let executor =
+            Executor::external(library, &signature_table).map_err(|error| match error {
+                ExecutorError::LoadSymbol { symbol, source } => {
+                    InitError::LoadSymbol { symbol, source }
+                }
+            })?;
+        Ok(Artifact {
+            gpu: self.gpu.clone(),
+            entry_points: entry_points(&signature_table),
+            _shared_object: shared_object,
+            executor,
+            signatures: signature_table,
+        })
+    }
+
+    /// Copy `u64` values into device memory for this context.
     pub fn mem_u64(&self, values: &[u64]) -> Result<MemOwn, MemError> {
-        self.mem_from_bytes(slice_as_bytes(values))
+        MemOwn::from_u64_slice(values, self.gpu.dialect())
     }
 
+    /// Copy `u16` values into device memory for this context.
     pub fn mem_u16(&self, values: &[u16]) -> Result<MemOwn, MemError> {
-        self.mem_from_bytes(slice_as_bytes(values))
+        MemOwn::from_u16_slice(values, self.gpu.dialect())
     }
 
+    /// Copy `f32` values into device memory for this context.
     pub fn mem_f32(&self, values: &[f32]) -> Result<MemOwn, MemError> {
-        self.mem_from_bytes(slice_as_bytes(values))
+        MemOwn::from_f32_slice(values, self.gpu.dialect())
     }
 
     /// Allocate an application-owned F32 device buffer initialized to zero.
     pub fn mem_f32_zeroed(&self, element_count: usize) -> Result<MemOwn, MemError> {
-        self.mem_zeroed(element_count, std::mem::size_of::<f32>())
-    }
-
-    /// Allocate an application-owned BF16 device buffer initialized to zero.
-    pub fn mem_bf16_zeroed(&self, element_count: usize) -> Result<MemOwn, MemError> {
-        self.mem_zeroed(element_count, std::mem::size_of::<u16>())
-    }
-
-    fn mem_zeroed(&self, element_count: usize, element_size: usize) -> Result<MemOwn, MemError> {
+        let element_size = std::mem::size_of::<f32>();
         let byte_len =
             element_count
                 .checked_mul(element_size)
@@ -204,6 +296,25 @@ impl Runtime {
                     element_count,
                     element_size,
                 })?;
+        self.mem_zeroed_bytes(byte_len as u64)
+    }
+
+    /// Allocate an application-owned BF16 device buffer initialized to zero.
+    pub fn mem_bf16_zeroed(&self, element_count: usize) -> Result<MemOwn, MemError> {
+        let element_size = std::mem::size_of::<u16>();
+        let bytes =
+            element_count
+                .checked_mul(element_size)
+                .ok_or(MemError::AllocationSizeOverflow {
+                    element_count,
+                    element_size,
+                })?;
+        self.mem_zeroed_bytes(bytes as u64)
+    }
+
+    pub(crate) fn mem_zeroed_bytes(&self, byte_len: u64) -> Result<MemOwn, MemError> {
+        let byte_len =
+            usize::try_from(byte_len).map_err(|_| MemError::LengthTooLarge { byte_len })?;
         let data = self.gpu.allocate(byte_len)?;
         // SAFETY: `data` is the unique allocation returned immediately above
         // by this same GPU API, and ownership is transferred into `MemOwn`.
@@ -212,18 +323,15 @@ impl Runtime {
         self.gpu.zero(data, byte_len)?;
         Ok(memory)
     }
+}
 
-    fn mem_from_bytes(&self, bytes: &[u8]) -> Result<MemOwn, MemError> {
-        let data = self.gpu.allocate(bytes.len())?;
-        // SAFETY: `data` is the unique allocation returned immediately above
-        // by this same GPU API, and ownership is transferred into `MemOwn`.
-        let mut memory =
-            unsafe { MemOwn::from_raw_parts_with_gpu(data, bytes.len() as u64, self.gpu.clone()) };
-        memory.write_from_host(bytes)?;
-        Ok(memory)
+impl Artifact {
+    /// Source-level functions compiled into this artifact, sorted by name.
+    pub fn entry_points(&self) -> &[EntryPoint] {
+        &self.entry_points
     }
 
-    /// Run a source-level `program` definition, which must have M arguments, and return its N arguments.
+    /// Run a source-level `program` definition.
     pub fn exec<'a, const M: usize, const N: usize>(
         &self,
         name: &str,
@@ -245,8 +353,8 @@ impl Runtime {
             .map(|values| values.try_into().expect("output arity already validated"))
     }
 
-    /// Run a source-level `program` with dynamically sized input and output
-    /// collections.
+    /// Run a source-level `program` with dynamically sized
+    /// input and output collections.
     ///
     /// This is the public execution boundary for adapters such as SafeRuntime,
     /// whose arities are known from a runtime protocol rather than const
@@ -263,12 +371,43 @@ impl Runtime {
         self.exec_symbol(name, signature, args)
     }
 
+    /// Run a source-level program while conservatively bounding every device
+    /// allocation made by generated code during this invocation. Allocations
+    /// are charged cumulatively; generated frees do not refund the limit.
+    pub(crate) fn exec_values_with_generated_allocation_budget<'a>(
+        &self,
+        name: &str,
+        args: Vec<Value<'a>>,
+        byte_limit: u64,
+    ) -> Result<Vec<Value<'static>>, ExecError> {
+        let signature = self
+            .signatures
+            .get(name)
+            .ok_or_else(|| ExecError::UnknownSourceFunction(name.to_string()))?;
+        self.exec_symbol_with_generated_allocation_budget(name, signature, args, Some(byte_limit))
+    }
+
     fn exec_symbol<'a>(
         &self,
         name: &str,
         signature: &FunctionSignature,
         args: Vec<Value<'a>>,
     ) -> Result<Vec<Value<'static>>, ExecError> {
+        self.exec_symbol_with_generated_allocation_budget(name, signature, args, None)
+    }
+
+    fn exec_symbol_with_generated_allocation_budget<'a>(
+        &self,
+        name: &str,
+        signature: &FunctionSignature,
+        args: Vec<Value<'a>>,
+        allocation_budget: Option<u64>,
+    ) -> Result<Vec<Value<'static>>, ExecError> {
+        // Reject unsupported limits while the caller's owned inputs are still
+        // Rust values, before transferring them across the generated-code ABI.
+        if allocation_budget.is_some() && !self.executor.supports_allocation_budget() {
+            return Err(ExecError::AllocationBudgetUnavailable);
+        }
         // Check input arity lines up with what's in the function signature.
         if signature.inputs.len() != args.len() {
             return Err(ExecError::InputArityMismatch {
@@ -301,10 +440,10 @@ impl Runtime {
                 Value::MemRef(memory) => Some(memory.dialect()),
                 _ => None,
             };
-            if let Some(dialect) = memory_dialect {
-                if self.gpu.dialect() != dialect {
-                    return Err(ExecError::IncompatibleDeviceMemory { index });
-                }
+            if let Some(dialect) = memory_dialect
+                && self.gpu.dialect() != dialect
+            {
+                return Err(ExecError::IncompatibleDeviceMemory { index });
             }
         }
 
@@ -321,16 +460,29 @@ impl Runtime {
             })
             .collect::<Vec<_>>();
 
-        self.executor
-            .call(&signature.symbol, &raw_inputs, &mut raw_outputs);
+        match allocation_budget {
+            Some(byte_limit) => self.executor.call_with_generated_allocation_budget(
+                &signature.symbol,
+                &raw_inputs,
+                &mut raw_outputs,
+                byte_limit,
+            ),
+            None => self
+                .executor
+                .call(&signature.symbol, &raw_inputs, &mut raw_outputs),
+        }
+
+        // Re-establish Rust ownership before the synchronization boundary. If
+        // synchronization reports a device fault, dropping `outputs` still
+        // attempts to release every allocation returned by generated code.
+        let outputs = raw_outputs
+            .into_iter()
+            .map(|output| self.resolve_output(output))
+            .collect::<Result<Vec<_>, _>>()?;
         self.gpu
             .synchronize()
             .map_err(|error| ExecError::GpuSynchronization(error.to_string()))?;
-
-        raw_outputs
-            .into_iter()
-            .map(|output| self.resolve_output(output))
-            .collect()
+        Ok(outputs)
     }
 
     fn resolve_output(&self, output: AbiValue) -> Result<Value<'static>, ExecError> {
@@ -360,11 +512,6 @@ fn ref_output(signatures: &SignatureTable) -> Option<(String, usize)> {
             .position(|kind| *kind == ValueKind::MemRef)
             .map(|index| (name.clone(), index))
     })
-}
-
-fn slice_as_bytes<T>(values: &[T]) -> &[u8] {
-    let byte_len = std::mem::size_of_val(values);
-    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), byte_len) }
 }
 
 fn load_generated_library(path: &Path) -> Result<Library, InitError> {
