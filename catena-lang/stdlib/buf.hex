@@ -297,6 +297,31 @@
       ({cap.own [.n] bf16} buf val)
     }})
 
+  # Matrix-core routed counterpart. Large route sets are grouped by expert
+  # internally; its ownership and output layout match the native GEMV.
+  (arr materializec.borrow-routed-native-bf16-gemm-wmma-pair :
+    {[input-cap gate-cap up-cap selected-cap n k.]
+      ({cap.own [.input-cap] bf16} buf val)
+      ({[.input-cap] u64} :)
+      ({cap.ref [.gate-cap] bf16} buf val)
+      ({[.gate-cap] u64} :)
+      ({cap.ref [.up-cap] bf16} buf val)
+      ({[.up-cap] u64} :)
+      ({cap.own [.selected-cap] u64} buf val)
+      ({[.selected-cap] u64} :)
+      ({[.n] u64} :)
+      ({[.k] u64} :)
+      (u64 val)
+      (u64 val)
+    }
+    ->
+    {[input-cap gate-cap up-cap selected-cap n k.] {
+      ({cap.own [.input-cap] bf16} buf val)
+      ({cap.own [.selected-cap] u64} buf val)
+      ({cap.own [.n] bf16} buf val)
+      ({cap.own [.n] bf16} buf val)
+    }})
+
   # Paired dense BF16 GEMV which returns the input owner.
   (arr materializec.borrow-native-bf16-gemv-pair :
     {[input-cap gate-cap up-cap n k.]
@@ -364,6 +389,32 @@
   # are BF16, accumulation and residual addition are F32, and the output is
   # rounded once to BF16. All owned inputs are returned after the launch.
   (arr materializec.borrow-routed-native-bf16-gemv-residual :
+    {[active-cap down-cap selected-cap residual-cap n k.]
+      ({cap.own [.active-cap] bf16} buf val)
+      ({[.active-cap] u64} :)
+      ({cap.ref [.down-cap] bf16} buf val)
+      ({[.down-cap] u64} :)
+      ({cap.own [.selected-cap] u64} buf val)
+      ({[.selected-cap] u64} :)
+      ({cap.own [.residual-cap] bf16} buf val)
+      ({[.residual-cap] u64} :)
+      ({[.n] u64} :)
+      ({[.k] u64} :)
+      (u64 val)
+      (u64 val)
+      (u64 val)
+    }
+    ->
+    {[active-cap down-cap selected-cap residual-cap n k.] {
+      ({cap.own [.active-cap] bf16} buf val)
+      ({cap.own [.selected-cap] u64} buf val)
+      ({cap.own [.residual-cap] bf16} buf val)
+      ({cap.own [.n] bf16} buf val)
+    }})
+
+  # HIP matrix-core routed down projection with the same ownership contract.
+  # Large route sets are grouped by expert and small shapes retain SIMT.
+  (arr materializec.borrow-routed-native-bf16-gemm-wmma-residual :
     {[active-cap down-cap selected-cap residual-cap n k.]
       ({cap.own [.active-cap] bf16} buf val)
       ({[.active-cap] u64} :)
