@@ -343,6 +343,78 @@ pub(in crate::codegen) fn render_borrow_call(
     Ok(())
 }
 
+// A power-of-two tile is a complete subtree of the specified logical-index
+// reduction. Its root can therefore be combined with other tile roots without
+// reassociating any f32 additions, including the final incomplete tile. Scratch
+// is bounded independently of the input length; roots use a binary carry stack.
+const REDUCTION_TILE: u64 = 4096;
+
+fn render_tiled_reduction_start(out: &mut String, len: &str, arrays: &[&str]) {
+    out.push_str("    extern __shared__ float reduction_storage[];\n");
+    out.push_str(&format!(
+        "    uint64_t tile_capacity = ({len}) < {REDUCTION_TILE} ? ({len}) : {REDUCTION_TILE};\n"
+    ));
+    out.push_str(&format!("    uint64_t tile_count = ({len}) / {REDUCTION_TILE} + (({len}) % {REDUCTION_TILE} != 0);\n"));
+    for (index, array) in arrays.iter().enumerate() {
+        out.push_str(&format!("    float *{array} = reduction_storage + {index} * tile_capacity;\n    __shared__ float {array}_roots[64];\n"));
+    }
+    out.push_str("    for (uint64_t tile_index = 0; tile_index < tile_count; ++tile_index) {\n");
+    out.push_str(&format!("        uint64_t tile_offset = tile_index * {REDUCTION_TILE};\n        uint64_t tile_len = ({len}) - tile_offset;\n        if (tile_len > {REDUCTION_TILE}) {{ tile_len = {REDUCTION_TILE}; }}\n"));
+    out.push_str("        for (uint64_t local_index = (uint64_t)threadIdx.x; local_index < tile_len; local_index += (uint64_t)blockDim.x) {\n            uint64_t reduction_index = tile_offset + local_index;\n");
+}
+
+fn render_tiled_reduction_end(out: &mut String, arrays: &[&str], maximum: bool) {
+    let combine = |left: &str, right: &str| {
+        if maximum {
+            format!("({right}) > ({left}) ? ({right}) : ({left})")
+        } else {
+            format!("({left}) + ({right})")
+        }
+    };
+    out.push_str("        }\n        __syncthreads();\n");
+    out.push_str("        for (uint64_t stride = 1; stride < tile_len; stride <<= 1) {\n            uint64_t step = stride << 1;\n            for (uint64_t left = (uint64_t)threadIdx.x * step; left + stride < tile_len; left += (uint64_t)blockDim.x * step) {\n");
+    for array in arrays {
+        let value = combine(
+            &format!("{array}[left]"),
+            &format!("{array}[left + stride]"),
+        );
+        out.push_str(&format!("                {array}[left] = {value};\n"));
+    }
+    // This remains correct for both 32- and 64-thread warps. A fixed stride
+    // threshold does not describe which producer threads the next level reads.
+    out.push_str("            }\n            __syncthreads();\n        }\n        if (threadIdx.x == 0) {\n            uint64_t carry = tile_index;\n            uint32_t level = 0;\n");
+    for array in arrays {
+        out.push_str(&format!("            float {array}_root = {array}[0];\n"));
+    }
+    out.push_str("            while ((carry & 1) != 0) {\n");
+    for array in arrays {
+        let value = combine(&format!("{array}_roots[level]"), &format!("{array}_root"));
+        out.push_str(&format!("                {array}_root = {value};\n"));
+    }
+    out.push_str("                carry >>= 1;\n                ++level;\n            }\n");
+    for array in arrays {
+        out.push_str(&format!(
+            "            {array}_roots[level] = {array}_root;\n"
+        ));
+    }
+    out.push_str("        }\n        __syncthreads();\n    }\n    if (threadIdx.x == 0 && tile_count != 0) {\n        bool present = false;\n        uint64_t remaining = tile_count;\n");
+    for array in arrays {
+        out.push_str(&format!("        float {array}_result = 0.0f;\n"));
+    }
+    out.push_str("        for (uint32_t level = 0; remaining != 0; ++level, remaining >>= 1) {\n            if ((remaining & 1) != 0) {\n");
+    for array in arrays {
+        let value = combine(&format!("{array}_roots[level]"), &format!("{array}_result"));
+        out.push_str(&format!(
+            "                {array}_result = present ? ({value}) : {array}_roots[level];\n"
+        ));
+    }
+    out.push_str("                present = true;\n            }\n        }\n");
+    for array in arrays {
+        out.push_str(&format!("        {array}[0] = {array}_result;\n"));
+    }
+    out.push_str("    }\n    __syncthreads();\n");
+}
+
 pub(in crate::codegen) fn render_reduce_f32_kernel(
     out: &mut String,
     kernel_name: &str,
@@ -374,10 +446,7 @@ pub(in crate::codegen) fn render_reduce_f32_kernel(
     out.push_str(") {\n");
     out.push_str("    uint64_t output_index = (uint64_t)blockIdx.x;\n");
     out.push_str("    if (output_index >= output_len) { return; }\n");
-    out.push_str("    extern __shared__ float reduction_terms[];\n");
-    out.push_str(
-        "    for (uint64_t reduction_index = (uint64_t)threadIdx.x; reduction_index < reduction_len; reduction_index += (uint64_t)blockDim.x) {\n",
-    );
+    render_tiled_reduction_start(out, "reduction_len", &["reduction_terms"]);
     out.push_str("        float term;\n");
     let output_index = GpuValue::Var(GpuVar {
         node: output.node,
@@ -398,20 +467,8 @@ pub(in crate::codegen) fn render_reduce_f32_kernel(
         lowered: LoweredType::Runtime(CType::F32),
     };
     render_function_application(out, "        ", term, &term_inputs, &[term_output])?;
-    out.push_str("        reduction_terms[reduction_index] = term;\n");
-    out.push_str("    }\n");
-    out.push_str("    __syncthreads();\n");
-    out.push_str("    for (uint64_t stride = 1; stride < reduction_len; stride <<= 1) {\n");
-    out.push_str("        uint64_t step = stride << 1;\n");
-    out.push_str(
-        "        for (uint64_t left = (uint64_t)threadIdx.x * step; left + stride < reduction_len; left += (uint64_t)blockDim.x * step) {\n",
-    );
-    out.push_str("            float left_value = reduction_terms[left];\n");
-    out.push_str("            float right_value = reduction_terms[left + stride];\n");
-    out.push_str("            reduction_terms[left] = left_value + right_value;\n");
-    out.push_str("        }\n");
-    out.push_str("        if (stride < 256) { __syncthreads(); } else { __syncwarp(); }\n");
-    out.push_str("    }\n");
+    out.push_str("        reduction_terms[local_index] = term;\n");
+    render_tiled_reduction_end(out, &["reduction_terms"], false);
     out.push_str("    if (threadIdx.x == 0) {\n");
     out.push_str("        float reduction_sum = reduction_len == 0 ? 0.0f : reduction_terms[0];\n");
     out.push_str(&format!("        {} value;\n", c_type(element)));
@@ -472,10 +529,7 @@ pub(in crate::codegen) fn render_reduce_f32_pair_kernel(
     out.push_str(") {\n");
     out.push_str("    uint64_t output_index = (uint64_t)blockIdx.x;\n");
     out.push_str("    if (output_index >= output_len) { return; }\n");
-    out.push_str("    extern __shared__ float reduction_terms[];\n");
-    out.push_str("    float *left_terms = reduction_terms;\n");
-    out.push_str("    float *right_terms = reduction_terms + reduction_len;\n");
-    out.push_str("    for (uint64_t reduction_index = (uint64_t)threadIdx.x; reduction_index < reduction_len; reduction_index += (uint64_t)blockDim.x) {\n");
+    render_tiled_reduction_start(out, "reduction_len", &["left_terms", "right_terms"]);
     out.push_str("        float left_term;\n");
     out.push_str("        float right_term;\n");
     let output_index = GpuValue::Var(GpuVar {
@@ -509,20 +563,9 @@ pub(in crate::codegen) fn render_reduce_f32_pair_kernel(
             },
         ],
     )?;
-    out.push_str("        left_terms[reduction_index] = left_term;\n");
-    out.push_str("        right_terms[reduction_index] = right_term;\n");
-    out.push_str("    }\n");
-    out.push_str("    __syncthreads();\n");
-    out.push_str("    for (uint64_t stride = 1; stride < reduction_len; stride <<= 1) {\n");
-    out.push_str("        uint64_t step = stride << 1;\n");
-    out.push_str("        for (uint64_t left = (uint64_t)threadIdx.x * step; left + stride < reduction_len; left += (uint64_t)blockDim.x * step) {\n");
-    out.push_str("            left_terms[left] = left_terms[left] + left_terms[left + stride];\n");
-    out.push_str(
-        "            right_terms[left] = right_terms[left] + right_terms[left + stride];\n",
-    );
-    out.push_str("        }\n");
-    out.push_str("        if (stride < 256) { __syncthreads(); } else { __syncwarp(); }\n");
-    out.push_str("    }\n");
+    out.push_str("        left_terms[local_index] = left_term;\n");
+    out.push_str("        right_terms[local_index] = right_term;\n");
+    render_tiled_reduction_end(out, &["left_terms", "right_terms"], false);
     out.push_str("    if (threadIdx.x == 0) {\n");
     out.push_str("        float left_sum = reduction_len == 0 ? 0.0f : left_terms[0];\n");
     out.push_str("        float right_sum = reduction_len == 0 ? 0.0f : right_terms[0];\n");
@@ -605,10 +648,7 @@ pub(in crate::codegen) fn render_borrow_reduce_f32_kernel(
     out.push_str(") {\n");
     out.push_str("    uint64_t output_index = (uint64_t)blockIdx.x;\n");
     out.push_str("    if (output_index >= output_len) { return; }\n");
-    out.push_str("    extern __shared__ float reduction_terms[];\n");
-    out.push_str(
-        "    for (uint64_t reduction_index = (uint64_t)threadIdx.x; reduction_index < reduction_len; reduction_index += (uint64_t)blockDim.x) {\n",
-    );
+    render_tiled_reduction_start(out, "reduction_len", &["reduction_terms"]);
     out.push_str("        float term;\n");
     let borrowed = GpuValue::Var(GpuVar {
         node: cache_output.node,
@@ -635,20 +675,8 @@ pub(in crate::codegen) fn render_borrow_reduce_f32_kernel(
         lowered: LoweredType::Runtime(CType::F32),
     };
     render_function_application(out, "        ", term, &term_inputs, &[term_output])?;
-    out.push_str("        reduction_terms[reduction_index] = term;\n");
-    out.push_str("    }\n");
-    out.push_str("    __syncthreads();\n");
-    out.push_str("    for (uint64_t stride = 1; stride < reduction_len; stride <<= 1) {\n");
-    out.push_str("        uint64_t step = stride << 1;\n");
-    out.push_str(
-        "        for (uint64_t left = (uint64_t)threadIdx.x * step; left + stride < reduction_len; left += (uint64_t)blockDim.x * step) {\n",
-    );
-    out.push_str(
-        "            reduction_terms[left] = reduction_terms[left] + reduction_terms[left + stride];\n",
-    );
-    out.push_str("        }\n");
-    out.push_str("        if (stride < 256) { __syncthreads(); } else { __syncwarp(); }\n");
-    out.push_str("    }\n");
+    out.push_str("        reduction_terms[local_index] = term;\n");
+    render_tiled_reduction_end(out, &["reduction_terms"], false);
     out.push_str("    if (threadIdx.x == 0) {\n");
     out.push_str("        float reduction_sum = reduction_len == 0 ? 0.0f : reduction_terms[0];\n");
     out.push_str(&format!("        {} value;\n", c_type(output_element)));
@@ -735,7 +763,7 @@ pub(in crate::codegen) fn render_borrow_routed_bf16_gemv_pair_kernel(
     out.push_str("            gate_terms[left] = gate_terms[left] + gate_terms[left + stride];\n");
     out.push_str("            up_terms[left] = up_terms[left] + up_terms[left + stride];\n");
     out.push_str("        }\n");
-    out.push_str("        if (stride < 256) { __syncthreads(); } else { __syncwarp(); }\n");
+    out.push_str("        if ((reduction_len - 1) / (stride << 1) >= (uint64_t)warpSize) { __syncthreads(); } else { __syncwarp(); }\n");
     out.push_str("    }\n");
     out.push_str("    if (threadIdx.x == 0) {\n");
     out.push_str("        gate_out[output_index] = reduction_len == 0 ? 0.0f : gate_terms[0];\n");
@@ -1861,7 +1889,6 @@ pub(in crate::codegen) fn render_borrow_reduce_f32_call(
         name = output.name,
         element = c_type(output_element)
     ));
-    out.push_str(&format!("    catena_assert(({reduction_len}) <= 16384);\n"));
     out.push_str(&format!("    if ({}_len != 0) {{\n", output.name));
     out.push_str(&format!(
         "        catena_host_buffer_allocate((void **)&{}_data, {}_len, sizeof({}));\n",
@@ -1870,7 +1897,7 @@ pub(in crate::codegen) fn render_borrow_reduce_f32_call(
         c_type(output_element)
     ));
     out.push_str(&format!(
-        "        {kernel_name}<<<dim3({}_len), dim3(({reduction_len}) > 4096 ? 512 : (({reduction_len}) > 1024 ? 256 : (({reduction_len}) > 256 ? 128 : 64))), ({reduction_len}) * sizeof(float)>>>(\n            {}, {}_data, {}_len, {reduction_len}",
+        "        {kernel_name}<<<dim3({}_len), dim3(({reduction_len}) > 4096 ? 512 : (({reduction_len}) > 1024 ? 256 : (({reduction_len}) > 256 ? 128 : 64))), (({reduction_len}) < {REDUCTION_TILE} ? ({reduction_len}) : {REDUCTION_TILE}) * sizeof(float)>>>(\n            {}, {}_data, {}_len, {reduction_len}",
         output.name,
         value_expr(cache),
         output.name,
@@ -2566,7 +2593,6 @@ pub(in crate::codegen) fn render_reduce_f32_call(
         name = output.name,
         element = c_type(output_element)
     ));
-    out.push_str(&format!("    catena_assert(({reduction_len}) <= 16384);\n"));
     out.push_str(&format!("    if ({}_len != 0) {{\n", output.name));
     out.push_str(&format!(
         "        catena_host_buffer_allocate((void **)&{}_data, {}_len, sizeof({}));\n",
@@ -2575,7 +2601,7 @@ pub(in crate::codegen) fn render_reduce_f32_call(
         c_type(output_element)
     ));
     out.push_str(&format!(
-        "        {kernel_name}<<<dim3({}_len), dim3(({reduction_len}) > 1024 ? 256 : 64), ({reduction_len}) * sizeof(float)>>>(\n            {}_data, {}_len, {reduction_len}",
+        "        {kernel_name}<<<dim3({}_len), dim3(({reduction_len}) > 1024 ? 256 : 64), (({reduction_len}) < {REDUCTION_TILE} ? ({reduction_len}) : {REDUCTION_TILE}) * sizeof(float)>>>(\n            {}_data, {}_len, {reduction_len}",
         output.name, output.name, output.name
     ));
     for arg in runtime_values(env) {
@@ -2609,7 +2635,6 @@ pub(in crate::codegen) fn render_reduce_f32_pair_call(
             name = output.name
         ));
     }
-    out.push_str(&format!("    catena_assert(({reduction_len}) <= 8192);\n"));
     out.push_str(&format!("    if ({output_len} != 0) {{\n"));
     for output in [left_output, right_output] {
         out.push_str(&format!(
@@ -2618,7 +2643,7 @@ pub(in crate::codegen) fn render_reduce_f32_pair_call(
         ));
     }
     out.push_str(&format!(
-        "        {kernel_name}<<<dim3({output_len}), dim3(({reduction_len}) > 1024 ? 256 : 64), 2 * ({reduction_len}) * sizeof(float)>>>(\n            {}_data, {}_data, {output_len}, {reduction_len}",
+        "        {kernel_name}<<<dim3({output_len}), dim3(({reduction_len}) > 1024 ? 256 : 64), 2 * (({reduction_len}) < {REDUCTION_TILE} ? ({reduction_len}) : {REDUCTION_TILE}) * sizeof(float)>>>(\n            {}_data, {}_data, {output_len}, {reduction_len}",
         left_output.name, right_output.name
     ));
     for arg in runtime_values(env) {
@@ -2661,36 +2686,22 @@ pub(in crate::codegen) fn render_softmax_f32_kernel(
     out.push_str("    uint64_t row = (uint64_t)blockIdx.x;\n");
     out.push_str("    if (row >= rows) { return; }\n");
     out.push_str("    uint64_t row_offset = row * columns;\n");
-    out.push_str("    extern __shared__ float reduction_terms[];\n");
-    out.push_str(
-        "    for (uint64_t column = (uint64_t)threadIdx.x; column < columns; column += (uint64_t)blockDim.x) {\n",
-    );
     let load = match element.as_ref() {
         CType::F32 => "data[row_offset + column]",
         CType::BF16 => "catena_bf16_to_f32(data[row_offset + column])",
         _ => unreachable!("element type was validated"),
     };
-    out.push_str(&format!("        reduction_terms[column] = {load};\n"));
-    out.push_str("    }\n");
-    out.push_str("    __syncthreads();\n");
-    out.push_str("    for (uint64_t stride = 1; stride < columns; stride <<= 1) {\n");
-    out.push_str("        uint64_t step = stride << 1;\n");
-    out.push_str(
-        "        for (uint64_t left = (uint64_t)threadIdx.x * step; left + stride < columns; left += (uint64_t)blockDim.x * step) {\n",
-    );
-    out.push_str("            float left_value = reduction_terms[left];\n");
-    out.push_str("            float right_value = reduction_terms[left + stride];\n");
-    out.push_str(
-        "            reduction_terms[left] = right_value > left_value ? right_value : left_value;\n",
-    );
-    out.push_str("        }\n");
-    out.push_str("        __syncthreads();\n");
-    out.push_str("    }\n");
-    out.push_str("    float row_maximum = reduction_terms[0];\n");
-    out.push_str("    __syncthreads();\n");
-    out.push_str(
-        "    for (uint64_t column = (uint64_t)threadIdx.x; column < columns; column += (uint64_t)blockDim.x) {\n",
-    );
+    out.push_str("    float row_maximum;\n    {\n");
+    render_tiled_reduction_start(out, "columns", &["reduction_terms"]);
+    out.push_str("            uint64_t column = reduction_index;\n");
+    out.push_str(&format!(
+        "            reduction_terms[local_index] = {load};\n"
+    ));
+    render_tiled_reduction_end(out, &["reduction_terms"], true);
+    out.push_str("    row_maximum = reduction_terms[0];\n    }\n    __syncthreads();\n");
+    out.push_str("    float denominator;\n    {\n");
+    render_tiled_reduction_start(out, "columns", &["reduction_terms"]);
+    out.push_str("            uint64_t column = reduction_index;\n");
     out.push_str(&format!("        float score = {load};\n"));
     out.push_str("        float numerator;\n");
     out.push_str("        if (catena_f32_bitcast_u32(score) == 0xFF800000u) {\n");
@@ -2715,24 +2726,12 @@ pub(in crate::codegen) fn render_softmax_f32_kernel(
         &[exponential_output],
     )?;
     out.push_str("        }\n");
-    out.push_str("        reduction_terms[column] = numerator;\n");
+    out.push_str("        reduction_terms[local_index] = numerator;\n");
     if element.as_ref() == &CType::F32 {
         out.push_str("        data[row_offset + column] = numerator;\n");
     }
-    out.push_str("    }\n");
-    out.push_str("    __syncthreads();\n");
-    out.push_str("    for (uint64_t stride = 1; stride < columns; stride <<= 1) {\n");
-    out.push_str("        uint64_t step = stride << 1;\n");
-    out.push_str(
-        "        for (uint64_t left = (uint64_t)threadIdx.x * step; left + stride < columns; left += (uint64_t)blockDim.x * step) {\n",
-    );
-    out.push_str(
-        "            reduction_terms[left] = reduction_terms[left] + reduction_terms[left + stride];\n",
-    );
-    out.push_str("        }\n");
-    out.push_str("        __syncthreads();\n");
-    out.push_str("    }\n");
-    out.push_str("    float denominator = reduction_terms[0];\n");
+    render_tiled_reduction_end(out, &["reduction_terms"], false);
+    out.push_str("    denominator = reduction_terms[0];\n    }\n");
     out.push_str(
         "    for (uint64_t column = (uint64_t)threadIdx.x; column < columns; column += (uint64_t)blockDim.x) {\n",
     );
@@ -2790,13 +2789,12 @@ pub(in crate::codegen) fn render_softmax_f32_call(
     let kernel_name = kernel_name(&function.name, assignment)?;
 
     out.push_str(&format!("    catena_assert(({columns}) != 0);\n"));
-    out.push_str(&format!("    catena_assert(({columns}) <= 16384);\n"));
     out.push_str(&format!(
         "    catena_assert(({capacity}) % ({columns}) == 0);\n"
     ));
     out.push_str(&format!("    if (({capacity}) != 0) {{\n"));
     out.push_str(&format!(
-        "        {kernel_name}<<<dim3(({capacity}) / ({columns})), dim3(({columns}) > 1024 ? 256 : 64), ({columns}) * sizeof(float)>>>(\n            {}, ({capacity}) / ({columns}), {columns});\n",
+        "        {kernel_name}<<<dim3(({capacity}) / ({columns})), dim3(({columns}) > 1024 ? 256 : 64), (({columns}) < {REDUCTION_TILE} ? ({columns}) : {REDUCTION_TILE}) * sizeof(float)>>>(\n            {}, ({capacity}) / ({columns}), {columns});\n",
         value_expr(buffer)
     ));
     out.push_str("    }\n");

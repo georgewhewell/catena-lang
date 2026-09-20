@@ -20,6 +20,13 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let functional_only = std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--functional-only");
+    if functional_only {
+        eprintln!("functional-only selected: deliberate worker fault coverage is skipped");
+    }
+
     let backend: Backend = std::env::var("CATENA_GPU_DIALECT")
         .unwrap_or_else(|_| "auto".into())
         .parse()
@@ -102,31 +109,35 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(callback_drop.termination == GenerationTermination::MaxNewTokens);
     anyhow::ensure!(model.generate_tokens(&[1, 2], 1, &[])?.generated_tokens == [5]);
 
-    // A device-side assertion must kill the worker. Returning a remote error
-    // would incorrectly leave a poisoned GPU context reusable.
-    let fault_model = session.bind_causal_lm(
-        &program,
-        ModelConfig {
-            entry_point: "causal-test-fault",
-            asset_slices: &asset_slices,
-            state_byte_multipliers: &state_multipliers,
-            vocabulary_size: 16,
-            maximum_capacity: 16,
-            generation_device_allocation_budget_bytes: 120,
-        },
-    )?;
-    let fault = fault_model.generate_tokens(&[1], 1, &[]).unwrap_err();
-    anyhow::ensure!(generation_killed_child(&fault));
-    anyhow::ensure!(matches!(
-        fault_model.generate_tokens(&[1], 1, &[]),
-        Err(GenerationError::Resident(
-            catena_lang::safe_runtime::ResidentError::Unavailable { .. }
-        ))
-    ));
+    if !functional_only {
+        // A device-side assertion must kill the worker. Returning a remote error
+        // would incorrectly leave a poisoned GPU context reusable.
+        let fault_model = session.bind_causal_lm(
+            &program,
+            ModelConfig {
+                entry_point: "causal-test-fault",
+                asset_slices: &asset_slices,
+                state_byte_multipliers: &state_multipliers,
+                vocabulary_size: 16,
+                maximum_capacity: 16,
+                generation_device_allocation_budget_bytes: 120,
+            },
+        )?;
+        let fault = fault_model.generate_tokens(&[1], 1, &[]).unwrap_err();
+        anyhow::ensure!(generation_killed_child(&fault));
+        anyhow::ensure!(matches!(
+            fault_model.generate_tokens(&[1], 1, &[]),
+            Err(GenerationError::Resident(
+                catena_lang::safe_runtime::ResidentError::Unavailable { .. }
+            ))
+        ));
+    }
     verify_chunked_prefix_cache(dialect)?;
     verify_known_insufficient_envelope_preserves_session(dialect)?;
-    verify_generated_allocation_overflow_isolation(dialect)?;
-    verify_generic_fault_isolation(dialect)?;
+    if !functional_only {
+        verify_generated_allocation_overflow_isolation(dialect)?;
+        verify_generic_fault_isolation(dialect)?;
+    }
     Ok(())
 }
 

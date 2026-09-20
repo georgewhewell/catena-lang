@@ -526,7 +526,8 @@
   # indices (0+1, 2+3, ...), carry an unmatched final value unchanged, and
   # repeat that rule over the surviving values until one remains. The empty
   # reduction is +0.0. Thread scheduling and block width must not change this
-  # tree. The current GPU implementation supports k <= 4096.
+  # tree. The GPU implementation reduces aligned power-of-two tiles with
+  # bounded shared scratch and combines their roots in this same tree.
   #
   # A GPU block computes one output, then applies an F32- or BF16-valued
   # epilogue to the exactly specified reduced sum. This is the Catena-native
@@ -564,8 +565,7 @@
   # the left operand unless the right operand is strictly greater. A
   # 0xFF800000 (-infinity) input maps directly to a +0 numerator; all other
   # numerators are exponential(value - maximum). If the denominator is zero,
-  # the entire row is +0. The current GPU implementation supports columns <=
-  # 8192.
+  # the entire row is +0. Shared scratch is bounded independently of columns.
   (arr materializec.softmax-f32 : {[n t.]
     ({cap.own [.n t]} buf val)
     ({[.n] u64} :)

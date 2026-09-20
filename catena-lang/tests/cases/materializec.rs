@@ -196,35 +196,39 @@ fn materialize_reduce_f32_pair_preserves_both_logical_index_trees() -> anyhow::R
 }
 
 #[test]
-fn materialize_reduction_wave_tail_matches_canonical_bits() -> anyhow::Result<()> {
+fn materialize_reduction_tiles_match_canonical_bits() -> anyhow::Result<()> {
     let runtime = runtime_with(SOURCE)?;
 
-    for len in [257_usize, 2_048, 6_144, 8_192, 16_384] {
+    for len in [
+        257_usize, 2_048, 4_095, 4_096, 4_097, 6_144, 8_193, 16_385, 28_673, 32_768, 32_769, 65_537,
+    ] {
         let values = (0..len)
-            .map(|index| match index % 8 {
-                0 => 1.0e20,
-                1 => 1.0,
-                2 => -1.0e20,
-                3 => 1.0,
-                4 => -0.0,
-                5 => 0.25,
-                6 => -0.5,
-                _ => 0.125,
-            })
+            .map(
+                |index| match (index.wrapping_mul(1_664_525) ^ (index >> 5)) % 8 {
+                    0 => 1.0e20,
+                    1 => 1.0,
+                    2 => -1.0e20,
+                    3 => 1.0,
+                    4 => -0.0,
+                    5 => 0.25,
+                    6 => -0.5,
+                    _ => 0.125,
+                },
+            )
             .collect::<Vec<_>>();
         let expected = canonical_adjacent_f32_sum(&values).to_bits();
 
-        let input = runtime.mem_f32(&values)?;
-        let [output] = runtime.exec(
-            "materialize-reduce-f32-rows",
-            [input.as_ref().into(), 1_u64.into(), (len as u64).into()],
-        )?;
-        let Value::MemOwn(output) = output else {
-            anyhow::bail!("reduce-f32 returned non-memory output: {output:?}");
-        };
-        assert_eq!(output.to_f32_vec()[0].to_bits(), expected, "len {len}");
+        {
+            let input = runtime.mem_f32(&values)?;
+            let [output] = runtime.exec(
+                "materialize-reduce-f32-rows",
+                [input.as_ref().into(), 1_u64.into(), (len as u64).into()],
+            )?;
+            let Value::MemOwn(output) = output else {
+                anyhow::bail!("reduce-f32 returned non-memory output: {output:?}");
+            };
+            assert_eq!(output.to_f32_vec()[0].to_bits(), expected, "len {len}");
 
-        if len <= 8_192 {
             let [left, right] = runtime.exec(
                 "materialize-reduce-f32-pair-rows",
                 [input.as_ref().into(), 1_u64.into(), (len as u64).into()],
@@ -379,6 +383,88 @@ fn materialize_softmax_f32_normalizes_rows_in_place() -> anyhow::Result<()> {
         output.to_f32_vec(),
         vec![0.0, 1.0 / 3.0, 2.0 / 3.0, 0.0, 0.5, 0.5]
     );
+    Ok(())
+}
+
+#[test]
+fn materialize_softmax_tiles_preserve_rows_and_canonical_bits() -> anyhow::Result<()> {
+    let runtime = runtime_with(SOURCE)?;
+    for columns in [4_097_usize, 8_193, 28_673, 32_768, 65_537] {
+        // Different adjacent tile roots, an incomplete final tile, and a fully
+        // masked row exercise both canonical reductions and owner reuse.
+        let mut values = (0..columns)
+            .map(|index| match index % 5 {
+                0 => f32::NEG_INFINITY,
+                1 => 0.25,
+                2 => 1.75,
+                3 => -0.0,
+                _ => 2.0,
+            })
+            .collect::<Vec<_>>();
+        values.extend(std::iter::repeat_n(f32::NEG_INFINITY, columns));
+        let numerators = values[..columns]
+            .iter()
+            .map(|&value| {
+                if value == f32::NEG_INFINITY {
+                    0.0
+                } else {
+                    (value - 2.0) + 2.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let denominator = canonical_adjacent_f32_sum(&numerators);
+        let mut expected = numerators
+            .into_iter()
+            .map(|value| (value / denominator).to_bits())
+            .collect::<Vec<_>>();
+        expected.extend(std::iter::repeat_n(0, columns));
+        let bf16_values = values
+            .iter()
+            .copied()
+            .map(half::bf16::from_f32)
+            .map(half::bf16::to_bits)
+            .collect::<Vec<_>>();
+        let bf16_input = runtime.mem_u16(&bf16_values)?;
+        let bf16_pointer = bf16_input.as_ptr();
+        let [bf16_output] = runtime.exec(
+            "materialize-softmax-bf16-rows",
+            [bf16_input.into(), (columns as u64).into()],
+        )?;
+        let Value::MemOwn(bf16_output) = bf16_output else {
+            anyhow::bail!("BF16 softmax returned non-memory");
+        };
+        assert_eq!(bf16_output.as_ptr(), bf16_pointer);
+        assert_eq!(
+            bf16_output.to_u16_vec(),
+            expected
+                .iter()
+                .copied()
+                .map(f32::from_bits)
+                .map(half::bf16::from_f32)
+                .map(half::bf16::to_bits)
+                .collect::<Vec<_>>(),
+            "BF16 columns {columns}"
+        );
+        let input = runtime.mem_f32(&values)?;
+        let pointer = input.as_ptr();
+        let [output] = runtime.exec(
+            "materialize-softmax-f32-rows",
+            [input.into(), (columns as u64).into()],
+        )?;
+        let Value::MemOwn(output) = output else {
+            anyhow::bail!("softmax returned non-memory");
+        };
+        assert_eq!(output.as_ptr(), pointer);
+        assert_eq!(
+            output
+                .to_f32_vec()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            expected,
+            "columns {columns}"
+        );
+    }
     Ok(())
 }
 
