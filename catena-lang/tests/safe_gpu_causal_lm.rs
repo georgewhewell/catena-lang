@@ -270,13 +270,13 @@ fn verify_chunked_prefix_cache(dialect: GpuDialect) -> anyhow::Result<()> {
         })
     };
     let cold = generate(
-        &[1, 2, 3, 4],
+        &[1, 2, 3, 4, 1, 2],
         GenerationOptions {
             prefix_cache_max_bytes: 0,
             ..options
         },
     )?;
-    let cold_short = [vec![0], vec![0, 1]]
+    let cold_short = [vec![0], vec![0, 1], vec![0, 1, 0], vec![0, 1, 0, 1]]
         .into_iter()
         .map(|prompt| {
             let result = generate(
@@ -289,37 +289,37 @@ fn verify_chunked_prefix_cache(dialect: GpuDialect) -> anyhow::Result<()> {
             Ok((prompt, result.generated_tokens))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let first = generate(&[1, 2, 3, 4], options)?;
+    let first = generate(&[1, 2, 3, 4, 1, 2], options)?;
     anyhow::ensure!(first.generated_tokens == cold.generated_tokens);
     anyhow::ensure!(first.stats.reused_prompt_tokens == 0);
     // The program mutates all state bytes in place on every call. Restoring
     // aliased state, or rewinding decode state, would produce different tokens.
-    let repeat = generate(&[1, 2, 3, 4], options)?;
+    let repeat = generate(&[1, 2, 3, 4, 1, 2], options)?;
     anyhow::ensure!(repeat.generated_tokens == cold.generated_tokens);
     anyhow::ensure!(repeat.stats.reused_prompt_tokens == 2);
-    anyhow::ensure!(repeat.stats.prefill_steps == 1);
+    anyhow::ensure!(repeat.stats.prefill_steps == 2);
     // Unrelated side requests cannot create a checkpoint. They must start
     // from zeroed state without discarding or mutating the main checkpoint.
     for (prompt, expected) in cold_short {
         let short = generate(&prompt, options)?;
         anyhow::ensure!(short.generated_tokens == expected);
         anyhow::ensure!(short.stats.reused_prompt_tokens == 0);
-        anyhow::ensure!(short.stats.prefill_steps == 1);
+        anyhow::ensure!(short.stats.prefill_steps as usize == prompt.len().div_ceil(2));
     }
-    let extended = generate(&[1, 2, 3, 4, 1, 2], options)?;
+    let extended = generate(&[1, 2, 3, 4, 1, 2, 3, 4], options)?;
     anyhow::ensure!(
         extended.stats.reused_prompt_tokens == 2,
         "short requests evicted the main prefix checkpoint"
     );
     let cold_extended = generate(
-        &[1, 2, 3, 4, 1, 2],
+        &[1, 2, 3, 4, 1, 2, 3, 4],
         GenerationOptions {
             prefix_cache_max_bytes: 0,
             ..options
         },
     )?;
     anyhow::ensure!(extended.generated_tokens == cold_extended.generated_tokens);
-    let _ = generate(&[1, 2, 3, 4], options)?;
+    let _ = generate(&[1, 2, 3, 4, 1, 2], options)?;
     let _ = generate(
         &[0],
         GenerationOptions {
@@ -327,10 +327,20 @@ fn verify_chunked_prefix_cache(dialect: GpuDialect) -> anyhow::Result<()> {
             ..options
         },
     )?;
-    let after_budget_miss = generate(&[1, 2, 3, 4, 1, 2], options)?;
+    let after_budget_miss = generate(&[1, 2, 3, 4, 1, 2, 3, 4], options)?;
     anyhow::ensure!(after_budget_miss.stats.reused_prompt_tokens == 0);
     anyhow::ensure!(after_budget_miss.generated_tokens == cold_extended.generated_tokens);
-    let _ = generate(&[1, 2, 3, 4], options)?;
+    let cold_suffix = generate(
+        &[1, 2, 0, 4, 1, 2],
+        GenerationOptions {
+            prefix_cache_max_bytes: 0,
+            ..options
+        },
+    )?;
+    let _ = generate(&[1, 2, 3, 4, 1, 2], options)?;
+    let suffix = generate(&[1, 2, 0, 4, 1, 2], options)?;
+    anyhow::ensure!(suffix.stats.reused_prompt_tokens == 2);
+    anyhow::ensure!(suffix.generated_tokens == cold_suffix.generated_tokens);
     let changed = generate(&[2, 2, 3, 4], options)?;
     anyhow::ensure!(changed.stats.reused_prompt_tokens == 0);
     let capacity = generate(

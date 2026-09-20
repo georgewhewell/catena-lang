@@ -269,13 +269,13 @@ impl ResidentStore {
                 cache.tokens.len() as u64,
             )
         } else {
-            // A one-chunk prompt cannot replace a checkpoint. Preserve a
+            // A prompt of at most two chunks cannot replace a checkpoint. Preserve a
             // compatible one while giving this request fresh zeroed state.
             // The same model and capacity guarantee its byte size matches the
             // reserved_cache_bytes already admitted to this request's budget.
             let preserve_checkpoint = cache_enabled
                 && prefix.as_ref().is_some_and(|request| {
-                    request.prompt_tokens.len() <= request.chunk_tokens as usize
+                    request.prompt_tokens.len() <= 2 * request.chunk_tokens as usize
                         && self.prefix_cache.as_ref().is_some_and(|cache| {
                             cache.matches_configuration(model, capacity, request)
                         })
@@ -333,7 +333,12 @@ impl ResidentStore {
         }
         let result = forward(runtime, assets, model, &mut generation_state, tokens)?;
         if let Some(prefix) = &generation_state.prefix {
-            let checkpoint = (prefix.prompt_tokens.len() - 1) / prefix.chunk_tokens as usize
+            // Leave one complete chunk before the final chunk unevaluated on
+            // restore. Chat templates can change their generation suffix when
+            // replaying an assistant tool call; caching that suffix loses the
+            // whole prefix. This only changes the snapshot point, not batches.
+            let checkpoint = ((prefix.prompt_tokens.len() - 1) / prefix.chunk_tokens as usize)
+                .saturating_sub(1)
                 * prefix.chunk_tokens as usize;
             if checkpoint > 0 && generation_state.position as usize == checkpoint {
                 // Deep copies preserve every byte, including arbitrary state outside

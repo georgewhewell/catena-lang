@@ -394,9 +394,9 @@ impl Model {
     /// Generate under a fixed, explicit prefill schedule with optional prefix
     /// reuse. Cold and warm requests execute identical batches at identical
     /// capacity. A hit restores independent copies of every mutable state byte.
-    /// The most recent checkpoint is before the final prefill chunk; final
-    /// prompt evaluation and token callbacks always execute for this request.
-    /// A one-chunk prompt preserves an earlier compatible checkpoint when its
+    /// The checkpoint leaves the final two prefill chunks for this request,
+    /// allowing short generation suffixes to change without losing the prefix.
+    /// A prompt of at most two chunks preserves a compatible checkpoint when its
     /// cache budget covers both that checkpoint and fresh generation state.
     pub fn generate_tokens_streaming_with_options(
         &self,
