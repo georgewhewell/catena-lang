@@ -2,6 +2,73 @@ use super::*;
 
 const SOURCE: &str = include_str!("../../examples/materializec.hex");
 
+#[test]
+fn native_bf16_gemv_accumulates_each_product_before_the_next() -> anyhow::Result<()> {
+    // Keep this fixture independent of BLAS and WMMA so the regression also
+    // runs on targets without those libraries or instructions.
+    let runtime = runtime_with(include_str!("../fixtures/bf16_gemv.hex"))?;
+    let bits = |value: f32| half::bf16::from_f32(value).to_bits();
+    for reduction in [514_u64, 515] {
+        // Lane 0 encounters 1, then 2^24 and -2^24 on its second pair.
+        // Separately rounded additions produce 0; adding the pair first
+        // incorrectly preserves 1. An odd length also exercises the tail.
+        let mut weight = vec![bits(0.0); reduction as usize];
+        weight[0] = bits(1.0);
+        weight[512] = bits(16777216.0);
+        weight[513] = bits(-16777216.0);
+        if reduction == 515 {
+            weight[514] = bits(2.0);
+        }
+        let expected = if reduction == 515 { 2.0 } else { 0.0 };
+        let weight = runtime.mem_u16(&weight)?;
+
+        for program in ["dense-pair", "routed-pair", "routed-residual"] {
+            let input_bits = vec![bits(1.0); reduction as usize];
+            let input = runtime.mem_u16(&input_bits)?;
+            let input_ptr = input.as_ptr();
+            let mut args = vec![input.into(), weight.as_ref().into()];
+            if program != "routed-residual" {
+                args.push(weight.as_ref().into());
+            }
+            if program != "dense-pair" {
+                args.push(runtime.mem_u64(&[0])?.into());
+            }
+            if program == "routed-residual" {
+                args.push(runtime.mem_u16(&[bits(4.0)])?.into());
+            }
+            args.push(reduction.into());
+            let outputs = runtime.exec_values(program, args)?;
+            let Value::MemOwn(input_after) = &outputs[0] else {
+                anyhow::bail!("{program} did not return its input owner");
+            };
+            assert_eq!(input_after.as_ptr(), input_ptr, "{program}");
+            assert_eq!(input_after.to_u16_vec(), input_bits, "{program}");
+            let output_start = match program {
+                "dense-pair" => 1,
+                "routed-pair" => 2,
+                _ => 3,
+            };
+            let expected = expected
+                + if program == "routed-residual" {
+                    4.0
+                } else {
+                    0.0
+                };
+            for output in &outputs[output_start..] {
+                let Value::MemOwn(output) = output else {
+                    anyhow::bail!("{program} returned a non-memory result");
+                };
+                assert_eq!(
+                    output.to_u16_vec(),
+                    [bits(expected)],
+                    "{program}, K={reduction}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn canonical_adjacent_f32_sum(values: &[f32]) -> f32 {
     if values.is_empty() {
         return 0.0;

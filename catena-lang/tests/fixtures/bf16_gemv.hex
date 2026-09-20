@@ -1,0 +1,71 @@
+(def program dense-pair :
+  {(cap.own mem) (cap.ref mem) (cap.ref mem) (u64 val)}
+  -> {(cap.own mem) (cap.own mem) (cap.own mem)}
+= ([input gate-weight up-weight reduction.]
+  ([.input] mem.cast.bf16 [input-count input-buffer.])
+  ([.gate-weight] mem.cast.bf16 [gate-count gate-buffer.])
+  ([.up-weight] mem.cast.bf16 [up-count up-buffer.])
+  (u64.one u64.name [output-count.])
+  ([.reduction] u64.name [reduction-count.])
+  {
+    [.input-buffer] [.input-count]
+    [.gate-buffer] [.gate-count]
+    [.up-buffer] [.up-count]
+    [.output-count] [.reduction-count] const.u64.0x0000000000000000 u64.one
+  } materializec.borrow-native-bf16-gemv-pair [input-after gate up.]
+  {
+    ({[.input-count] [.input-after]} buf.to-mem)
+    ({[.output-count] [.gate]} buf.to-mem)
+    ({[.output-count] [.up]} buf.to-mem)
+  }
+))
+
+(def program routed-pair :
+  {(cap.own mem) (cap.ref mem) (cap.ref mem) (cap.own mem) (u64 val)}
+  -> {(cap.own mem) (cap.own mem) (cap.own mem) (cap.own mem)}
+= ([input gate-weight up-weight selected reduction.]
+  ([.input] mem.cast.bf16 [input-count input-buffer.])
+  ([.gate-weight] mem.cast.bf16 [gate-count gate-buffer.])
+  ([.up-weight] mem.cast.bf16 [up-count up-buffer.])
+  ([.selected] mem.cast.u64 [selected-count selected-buffer.])
+  (u64.one u64.name [output-count.])
+  ([.reduction] u64.name [reduction-count.])
+  {
+    [.input-buffer] [.input-count]
+    [.gate-buffer] [.gate-count]
+    [.up-buffer] [.up-count]
+    [.selected-buffer] [.selected-count]
+    [.output-count] [.reduction-count] u64.one u64.one
+  } materializec.borrow-routed-native-bf16-gemv-pair [input-after selected-after gate up.]
+  {
+    ({[.input-count] [.input-after]} buf.to-mem)
+    ({[.selected-count] [.selected-after]} buf.to-mem)
+    ({[.output-count] [.gate]} buf.to-mem)
+    ({[.output-count] [.up]} buf.to-mem)
+  }
+))
+
+(def program routed-residual :
+  {(cap.own mem) (cap.ref mem) (cap.own mem) (cap.own mem) (u64 val)}
+  -> {(cap.own mem) (cap.own mem) (cap.own mem) (cap.own mem)}
+= ([active down-weight selected residual reduction.]
+  ([.active] mem.cast.bf16 [active-count active-buffer.])
+  ([.down-weight] mem.cast.bf16 [down-count down-buffer.])
+  ([.selected] mem.cast.u64 [selected-count selected-buffer.])
+  ([.residual] mem.cast.bf16 [residual-count residual-buffer.])
+  (u64.one u64.name [output-count.])
+  ([.reduction] u64.name [reduction-count.])
+  {
+    [.active-buffer] [.active-count]
+    [.down-buffer] [.down-count]
+    [.selected-buffer] [.selected-count]
+    [.residual-buffer] [.residual-count]
+    [.output-count] [.reduction-count] u64.one [.reduction] u64.one
+  } materializec.borrow-routed-native-bf16-gemv-residual [active-after selected-after residual-after output.]
+  {
+    ({[.active-count] [.active-after]} buf.to-mem)
+    ({[.selected-count] [.selected-after]} buf.to-mem)
+    ({[.residual-count] [.residual-after]} buf.to-mem)
+    ({[.output-count] [.output]} buf.to-mem)
+  }
+))

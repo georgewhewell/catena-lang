@@ -826,16 +826,16 @@ pub(in crate::codegen) fn render_borrow_native_bf16_gemv_pair_kernel(
             out.push_str("        uint64_t index = pair << 1;\n");
             out.push_str("        float x0 = catena_bf16_to_f32(input[input_base + index]);\n");
             out.push_str("        float x1 = catena_bf16_to_f32(input[input_base + index + 1]);\n");
-            out.push_str("        gate_sum += x0 * catena_bf16_to_f32(gate_weight[weight_base + index]) + x1 * catena_bf16_to_f32(gate_weight[weight_base + index + 1]);\n");
-            out.push_str("        up_sum += x0 * catena_bf16_to_f32(up_weight[weight_base + index]) + x1 * catena_bf16_to_f32(up_weight[weight_base + index + 1]);\n");
+            out.push_str("        gate_sum = (gate_sum + x0 * catena_bf16_to_f32(gate_weight[weight_base + index])) + x1 * catena_bf16_to_f32(gate_weight[weight_base + index + 1]);\n");
+            out.push_str("        up_sum = (up_sum + x0 * catena_bf16_to_f32(up_weight[weight_base + index])) + x1 * catena_bf16_to_f32(up_weight[weight_base + index + 1]);\n");
             out.push_str("#endif\n");
         }
         GpuDialect::Cuda => {
             out.push_str("        uint64_t index = pair << 1;\n");
             out.push_str("        float x0 = catena_bf16_to_f32(input[input_base + index]);\n");
             out.push_str("        float x1 = catena_bf16_to_f32(input[input_base + index + 1]);\n");
-            out.push_str("        gate_sum += x0 * catena_bf16_to_f32(gate_weight[weight_base + index]) + x1 * catena_bf16_to_f32(gate_weight[weight_base + index + 1]);\n");
-            out.push_str("        up_sum += x0 * catena_bf16_to_f32(up_weight[weight_base + index]) + x1 * catena_bf16_to_f32(up_weight[weight_base + index + 1]);\n");
+            out.push_str("        gate_sum = (gate_sum + x0 * catena_bf16_to_f32(gate_weight[weight_base + index])) + x1 * catena_bf16_to_f32(gate_weight[weight_base + index + 1]);\n");
+            out.push_str("        up_sum = (up_sum + x0 * catena_bf16_to_f32(up_weight[weight_base + index])) + x1 * catena_bf16_to_f32(up_weight[weight_base + index + 1]);\n");
         }
     }
     out.push_str("    }\n");
@@ -923,16 +923,16 @@ pub(in crate::codegen) fn render_borrow_routed_native_bf16_gemv_pair_kernel(
             out.push_str("        uint64_t index = pair << 1;\n");
             out.push_str("        float x0 = catena_bf16_to_f32(input[input_base + index]);\n");
             out.push_str("        float x1 = catena_bf16_to_f32(input[input_base + index + 1]);\n");
-            out.push_str("        gate_sum += x0 * catena_bf16_to_f32(gate_weight[weight_base + index]) + x1 * catena_bf16_to_f32(gate_weight[weight_base + index + 1]);\n");
-            out.push_str("        up_sum += x0 * catena_bf16_to_f32(up_weight[weight_base + index]) + x1 * catena_bf16_to_f32(up_weight[weight_base + index + 1]);\n");
+            out.push_str("        gate_sum = (gate_sum + x0 * catena_bf16_to_f32(gate_weight[weight_base + index])) + x1 * catena_bf16_to_f32(gate_weight[weight_base + index + 1]);\n");
+            out.push_str("        up_sum = (up_sum + x0 * catena_bf16_to_f32(up_weight[weight_base + index])) + x1 * catena_bf16_to_f32(up_weight[weight_base + index + 1]);\n");
             out.push_str("#endif\n");
         }
         GpuDialect::Cuda => {
             out.push_str("        uint64_t index = pair << 1;\n");
             out.push_str("        float x0 = catena_bf16_to_f32(input[input_base + index]);\n");
             out.push_str("        float x1 = catena_bf16_to_f32(input[input_base + index + 1]);\n");
-            out.push_str("        gate_sum += x0 * catena_bf16_to_f32(gate_weight[weight_base + index]) + x1 * catena_bf16_to_f32(gate_weight[weight_base + index + 1]);\n");
-            out.push_str("        up_sum += x0 * catena_bf16_to_f32(up_weight[weight_base + index]) + x1 * catena_bf16_to_f32(up_weight[weight_base + index + 1]);\n");
+            out.push_str("        gate_sum = (gate_sum + x0 * catena_bf16_to_f32(gate_weight[weight_base + index])) + x1 * catena_bf16_to_f32(gate_weight[weight_base + index + 1]);\n");
+            out.push_str("        up_sum = (up_sum + x0 * catena_bf16_to_f32(up_weight[weight_base + index])) + x1 * catena_bf16_to_f32(up_weight[weight_base + index + 1]);\n");
         }
     }
     out.push_str("    }\n");
@@ -1156,7 +1156,7 @@ pub(in crate::codegen) fn render_borrow_routed_native_bf16_gemv_residual_kernel(
             out.push_str("        float w0 = catena_bf16_to_f32(down_weight[weight_base]);\n");
             out.push_str("        uint64_t flat1 = flat + 1; uint64_t slot1 = flat1 / intermediate; uint64_t channel1 = flat1 % intermediate; uint64_t expert1 = selected[row * slots + slot1];\n");
             out.push_str("        uint64_t weight1 = (expert1 * output_features + output_feature) * intermediate + channel1;\n");
-            out.push_str("        sum += x0 * w0 + catena_bf16_to_f32(active[active_base + flat1]) * catena_bf16_to_f32(down_weight[weight1]);\n");
+            out.push_str("        sum = (sum + x0 * w0) + catena_bf16_to_f32(active[active_base + flat1]) * catena_bf16_to_f32(down_weight[weight1]);\n");
             out.push_str("#endif\n");
         }
         GpuDialect::Cuda => {
@@ -1164,7 +1164,7 @@ pub(in crate::codegen) fn render_borrow_routed_native_bf16_gemv_residual_kernel(
             out.push_str("        float w0 = catena_bf16_to_f32(down_weight[weight_base]);\n");
             out.push_str("        uint64_t flat1 = flat + 1; uint64_t slot1 = flat1 / intermediate; uint64_t channel1 = flat1 % intermediate; uint64_t expert1 = selected[row * slots + slot1];\n");
             out.push_str("        uint64_t weight1 = (expert1 * output_features + output_feature) * intermediate + channel1;\n");
-            out.push_str("        sum += x0 * w0 + catena_bf16_to_f32(active[active_base + flat1]) * catena_bf16_to_f32(down_weight[weight1]);\n");
+            out.push_str("        sum = (sum + x0 * w0) + catena_bf16_to_f32(active[active_base + flat1]) * catena_bf16_to_f32(down_weight[weight1]);\n");
         }
     }
     out.push_str("    }\n");
