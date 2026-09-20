@@ -120,10 +120,19 @@ struct PrefixCheckpoint {
 }
 
 impl PrefixCheckpoint {
-    fn matches(&self, model: u64, capacity: u64, request: &WirePrefixRequest) -> bool {
+    fn matches_configuration(
+        &self,
+        model: u64,
+        capacity: u64,
+        request: &WirePrefixRequest,
+    ) -> bool {
         self.model == model
             && self.capacity == capacity
             && self.chunk_tokens == request.chunk_tokens
+    }
+
+    fn matches(&self, model: u64, capacity: u64, request: &WirePrefixRequest) -> bool {
+        self.matches_configuration(model, capacity, request)
             && self.tokens.len() < request.prompt_tokens.len()
             && request.prompt_tokens.starts_with(&self.tokens)
     }
@@ -260,8 +269,20 @@ impl ResidentStore {
                 cache.tokens.len() as u64,
             )
         } else {
-            // Free a previous checkpoint before allocating this generation.
-            self.prefix_cache = None;
+            // A one-chunk prompt cannot replace a checkpoint. Preserve a
+            // compatible one while giving this request fresh zeroed state.
+            // The same model and capacity guarantee its byte size matches the
+            // reserved_cache_bytes already admitted to this request's budget.
+            let preserve_checkpoint = cache_enabled
+                && prefix.as_ref().is_some_and(|request| {
+                    request.prompt_tokens.len() <= request.chunk_tokens as usize
+                        && self.prefix_cache.as_ref().is_some_and(|cache| {
+                            cache.matches_configuration(model, capacity, request)
+                        })
+                });
+            if !preserve_checkpoint {
+                self.prefix_cache = None;
+            }
             let mut states = Vec::with_capacity(state_byte_lens.len());
             for byte_len in state_byte_lens {
                 states.push(runtime.mem_zeroed_bytes(byte_len)?);

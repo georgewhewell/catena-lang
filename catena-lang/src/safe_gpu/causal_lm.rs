@@ -396,6 +396,8 @@ impl Model {
     /// capacity. A hit restores independent copies of every mutable state byte.
     /// The most recent checkpoint is before the final prefill chunk; final
     /// prompt evaluation and token callbacks always execute for this request.
+    /// A one-chunk prompt preserves an earlier compatible checkpoint when its
+    /// cache budget covers both that checkpoint and fresh generation state.
     pub fn generate_tokens_streaming_with_options(
         &self,
         prompt_tokens: &[u32],

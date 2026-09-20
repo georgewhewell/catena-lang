@@ -276,6 +276,19 @@ fn verify_chunked_prefix_cache(dialect: GpuDialect) -> anyhow::Result<()> {
             ..options
         },
     )?;
+    let cold_short = [vec![0], vec![0, 1]]
+        .into_iter()
+        .map(|prompt| {
+            let result = generate(
+                &prompt,
+                GenerationOptions {
+                    prefix_cache_max_bytes: 0,
+                    ..options
+                },
+            )?;
+            Ok((prompt, result.generated_tokens))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let first = generate(&[1, 2, 3, 4], options)?;
     anyhow::ensure!(first.generated_tokens == cold.generated_tokens);
     anyhow::ensure!(first.stats.reused_prompt_tokens == 0);
@@ -285,8 +298,19 @@ fn verify_chunked_prefix_cache(dialect: GpuDialect) -> anyhow::Result<()> {
     anyhow::ensure!(repeat.generated_tokens == cold.generated_tokens);
     anyhow::ensure!(repeat.stats.reused_prompt_tokens == 2);
     anyhow::ensure!(repeat.stats.prefill_steps == 1);
+    // Unrelated side requests cannot create a checkpoint. They must start
+    // from zeroed state without discarding or mutating the main checkpoint.
+    for (prompt, expected) in cold_short {
+        let short = generate(&prompt, options)?;
+        anyhow::ensure!(short.generated_tokens == expected);
+        anyhow::ensure!(short.stats.reused_prompt_tokens == 0);
+        anyhow::ensure!(short.stats.prefill_steps == 1);
+    }
     let extended = generate(&[1, 2, 3, 4, 1, 2], options)?;
-    anyhow::ensure!(extended.stats.reused_prompt_tokens == 2);
+    anyhow::ensure!(
+        extended.stats.reused_prompt_tokens == 2,
+        "short requests evicted the main prefix checkpoint"
+    );
     let cold_extended = generate(
         &[1, 2, 3, 4, 1, 2],
         GenerationOptions {
@@ -295,6 +319,17 @@ fn verify_chunked_prefix_cache(dialect: GpuDialect) -> anyhow::Result<()> {
         },
     )?;
     anyhow::ensure!(extended.generated_tokens == cold_extended.generated_tokens);
+    let _ = generate(&[1, 2, 3, 4], options)?;
+    let _ = generate(
+        &[0],
+        GenerationOptions {
+            prefix_cache_max_bytes: 127,
+            ..options
+        },
+    )?;
+    let after_budget_miss = generate(&[1, 2, 3, 4, 1, 2], options)?;
+    anyhow::ensure!(after_budget_miss.stats.reused_prompt_tokens == 0);
+    anyhow::ensure!(after_budget_miss.generated_tokens == cold_extended.generated_tokens);
     let _ = generate(&[1, 2, 3, 4], options)?;
     let changed = generate(&[2, 2, 3, 4], options)?;
     anyhow::ensure!(changed.stats.reused_prompt_tokens == 0);
@@ -316,7 +351,7 @@ fn verify_chunked_prefix_cache(dialect: GpuDialect) -> anyhow::Result<()> {
     )?;
     anyhow::ensure!(chunks.stats.reused_prompt_tokens == 0);
     eprintln!(
-        "chunked prefix cache: repeated/extended prompts match cold runs; state copies and policy misses verified"
+        "chunked prefix cache: main/short/growing prompts match cold runs; state copies and policy/budget misses verified"
     );
     Ok(())
 }
