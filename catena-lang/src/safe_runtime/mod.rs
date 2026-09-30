@@ -8,6 +8,7 @@
 //! status and stderr.
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     env, fs,
     fs::File,
@@ -65,6 +66,37 @@ pub const DEFAULT_COMPILE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Default wall-clock limit for one isolated GPU operation or full generation.
 pub const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+thread_local! {
+    static JOB_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Apply one absolute deadline across all operations on this thread, including
+/// construction, compilation, asset loading and generation on cached sessions.
+/// Nested scopes can only shorten it. The previous scope is restored on unwind.
+///
+/// Run the synchronous job inside this closure on its dedicated thread. This
+/// scope does not follow async tasks or other threads. The operation watchdogs
+/// kill the private GPU worker process group; arbitrary host callbacks must
+/// still return before their caller can release its own resources.
+pub fn with_job_deadline<R>(deadline: Instant, operation: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            JOB_DEADLINE.set(self.0);
+        }
+    }
+    let previous = JOB_DEADLINE.get();
+    let _restore = Restore(previous);
+    JOB_DEADLINE.set(Some(previous.map_or(deadline, |old| old.min(deadline))));
+    operation()
+}
+
+fn job_timeout(timeout: Duration) -> Duration {
+    JOB_DEADLINE.get().map_or(timeout, |deadline| {
+        timeout.min(deadline.saturating_duration_since(Instant::now()))
+    })
+}
 
 const DROP_GRACE_TIMEOUT: Duration = Duration::from_millis(250);
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1864,8 +1896,51 @@ pub fn run_safe_runtime_child_if_requested() -> Result<bool, ChildMainError> {
     let asset_socket = duplicate_unix_stream(CHILD_ASSET_SOCKET_FD).map_err(|error| {
         ChildMainError::Protocol(format!("invalid worker asset socket: {error}"))
     })?;
+    watch_parent_lifetime(&asset_socket).map_err(|error| {
+        ChildMainError::Protocol(format!("cannot watch worker parent lifetime: {error}"))
+    })?;
     run_child_loop(stdin.lock(), stdout.lock(), &asset_socket)?;
     Ok(true)
+}
+
+// A parent watchdog disappears on parent death. Observe the already-private
+// asset socket without consuming its descriptor-transfer messages. Its last
+// peer closes when the parent dies, including when the main child thread is
+// blocked in a driver or compiler. Kill descendants as well as the leader.
+fn watch_parent_lifetime(socket: &UnixStream) -> io::Result<()> {
+    let pid = unsafe { libc::getpid() };
+    if pid <= 1 || unsafe { libc::getpgrp() } != pid {
+        return Err(io::Error::other(
+            "worker must lead its private process group",
+        ));
+    }
+    let socket = socket.try_clone()?;
+    thread::Builder::new()
+        .name("catena-parent-lifetime".into())
+        .spawn(move || {
+            loop {
+                let mut poll = libc::pollfd {
+                    fd: socket.as_raw_fd(),
+                    events: 0,
+                    revents: 0,
+                };
+                let result = unsafe { libc::poll(&mut poll, 1, -1) };
+                if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if result != 0 {
+                    // This executing thread keeps its own leader's PID allocated:
+                    // unlike an external watchdog, this signal cannot target a
+                    // recycled process-group ID. Unexpected poll failures also
+                    // fail closed instead of losing the lifetime guarantee.
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                        libc::_exit(125);
+                    }
+                }
+            }
+        })?;
+    Ok(())
 }
 
 fn duplicate_unix_stream(descriptor: RawFd) -> io::Result<UnixStream> {
@@ -2940,7 +3015,7 @@ impl WorkerProcess {
 
     fn arm_deadline(&mut self, timeout: Duration) -> Result<ProcessGroupDeadline, WorkerError> {
         self.ensure_available()?;
-        match ProcessGroupDeadline::arm(self.process_group.clone(), timeout) {
+        match ProcessGroupDeadline::arm(self.process_group.clone(), job_timeout(timeout)) {
             Ok(deadline) => Ok(deadline),
             Err(error) => {
                 // Running without the promised watchdog is not a recoverable
@@ -2958,6 +3033,7 @@ impl WorkerProcess {
         kind: DeadlineKind,
         operation: impl FnOnce(&mut Self, &ProcessGroupDeadline) -> Result<T, WorkerError>,
     ) -> Result<T, WorkerError> {
+        let timeout = timeout.min(deadline.timeout);
         if deadline.timed_out() {
             self.invalidate_after_timeout();
             return Err(WorkerError::TimedOut { kind, timeout });
@@ -2980,6 +3056,7 @@ impl WorkerProcess {
         timeout: Duration,
         kind: DeadlineKind,
     ) -> Result<(), WorkerError> {
+        let timeout = timeout.min(deadline.timeout);
         if deadline.finish() {
             self.invalidate_after_timeout();
             Err(WorkerError::TimedOut { kind, timeout })
@@ -4294,6 +4371,124 @@ mod error_tests {
                 Err(error) => panic!("unexpected lifecycle error after Drop: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn job_deadline_spans_operations_and_restores_after_unwind() {
+        let original = Instant::now() + Duration::from_secs(2);
+        assert_eq!(JOB_DEADLINE.get(), None);
+        let _ = std::panic::catch_unwind(|| {
+            with_job_deadline(original, || {
+                assert_eq!(JOB_DEADLINE.get(), Some(original));
+                with_job_deadline(original + Duration::from_secs(10), || {
+                    assert_eq!(JOB_DEADLINE.get(), Some(original));
+                });
+                let earlier = original - Duration::from_secs(1);
+                with_job_deadline(earlier, || assert_eq!(JOB_DEADLINE.get(), Some(earlier)));
+                assert_eq!(JOB_DEADLINE.get(), Some(original));
+                panic!("scope unwind fixture");
+            })
+        });
+        assert_eq!(JOB_DEADLINE.get(), None);
+
+        let executable = env::current_exe().unwrap();
+        let mut command = Command::new(&executable);
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "safe_runtime::error_tests::bounded_drop_process_fixture",
+            ])
+            .env(DROP_FIXTURE_ENV, "1");
+        let mut worker = WorkerProcess::spawn_command(command, &executable).unwrap();
+        with_job_deadline(Instant::now() + Duration::from_millis(100), || {
+            let first = worker.arm_deadline(Duration::from_secs(60)).unwrap();
+            assert!(first.timeout <= Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(20));
+            let timeout = first.timeout;
+            drop(first);
+            let second = worker.arm_deadline(Duration::from_secs(60)).unwrap();
+            assert!(
+                second.timeout < timeout,
+                "second operation must not reset the job deadline"
+            );
+            let limit = Instant::now() + Duration::from_secs(2);
+            while worker.process_group.kill_count() == 0 {
+                assert!(Instant::now() < limit);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(second.finish());
+        });
+        assert!(
+            worker
+                .wait_for_exit(Duration::from_secs(2))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn parent_socket_loss_kills_blocked_worker_and_descendant() {
+        let executable = env::current_exe().unwrap();
+        let mut command = Command::new(&executable);
+        command.args([
+            "--ignored",
+            "--exact",
+            "safe_runtime::error_tests::parent_loss_process_fixture",
+            "--nocapture",
+        ]);
+        let mut worker = WorkerProcess::spawn_command(command, &executable).unwrap();
+        let limit = Instant::now() + Duration::from_secs(5);
+        loop {
+            if worker
+                .stderr_tail
+                .lock()
+                .unwrap()
+                .render()
+                .contains("CATENA_DESCENDANT_READY")
+            {
+                break;
+            }
+            assert!(Instant::now() < limit, "descendant readiness");
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Drop just the parent endpoint. No parent-side kill, timeout, wait or
+        // WorkerProcess destructor can mask a broken child lifetime watcher.
+        let (replacement, _peer) = UnixStream::pair().unwrap();
+        drop(std::mem::replace(&mut worker.asset_socket, replacement));
+        worker
+            .stderr_done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocked worker or descendant survived parent socket closure");
+        assert_eq!(worker.process_group.kill_count(), 0);
+        assert!(
+            worker
+                .wait_for_exit(Duration::from_secs(2))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[ignore = "spawned only by parent_socket_loss_kills_blocked_worker_and_descendant"]
+    #[allow(clippy::zombie_processes)] // The fixture is killed with its descendant before wait.
+    fn parent_loss_process_fixture() {
+        let socket = duplicate_unix_stream(CHILD_ASSET_SOCKET_FD).unwrap();
+        watch_parent_lifetime(&socket).unwrap();
+        Command::new(env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "safe_runtime::error_tests::bounded_drop_process_fixture",
+                "--nocapture",
+            ])
+            .env(DROP_FIXTURE_ENV, "1")
+            .env(EOF_DESCENDANT_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_secs(60));
     }
 
     #[test]
