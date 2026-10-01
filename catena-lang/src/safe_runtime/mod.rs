@@ -122,7 +122,7 @@ impl SafeRuntime {
     /// Create a process-isolated context for the selected GPU dialect.
     pub fn new(dialect: GpuDialect) -> Result<Self, SafeInitError> {
         let executable = env::current_exe().map_err(SafeInitError::CurrentExecutable)?;
-        let ipc = IpcTransport::load(dialect)?;
+        let ipc = IpcTransport::load(dialect.into())?;
         let mut worker = WorkerProcess::spawn(&executable)?;
         worker
             .send(&Request::Initialize { dialect })
@@ -244,7 +244,7 @@ impl Artifact {
                 Value::U64(value) => WireValue::U64(*value),
                 Value::F32(value) => WireValue::F32(*value),
                 Value::MemOwn(memory) => {
-                    if memory.dialect() != self.session.ipc.dialect() {
+                    if memory.backend() != self.session.ipc.backend() {
                         return Err(SafeExecError::Runtime(
                             ExecError::IncompatibleDeviceMemory { index },
                         ));
@@ -258,7 +258,7 @@ impl Artifact {
                     }
                 }
                 Value::MemRef(memory) => {
-                    if memory.dialect() != self.session.ipc.dialect() {
+                    if memory.backend() != self.session.ipc.backend() {
                         return Err(SafeExecError::Runtime(
                             ExecError::IncompatibleDeviceMemory { index },
                         ));
@@ -365,7 +365,7 @@ fn run_child_loop(mut reader: impl Read, mut writer: impl io::Write) -> Result<(
         return Err(ChildMainError::ExpectedInitialization);
     };
 
-    let mut runtime = match Runtime::new(dialect) {
+    let runtime = match Runtime::new(dialect) {
         Ok(runtime) => runtime,
         Err(error) => {
             write_response(&mut writer, &Response::Initialized(Err(error.to_string())))?;

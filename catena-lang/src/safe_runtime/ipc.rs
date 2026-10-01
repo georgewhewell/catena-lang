@@ -8,7 +8,7 @@ use std::{ffi::c_void, sync::Arc};
 
 use crate::{
     gpu::{GpuApi, IPC_HANDLE_BYTES, RawIpcMemHandle},
-    runtime::{GpuDialect, MemError, MemOwn, MemRef, Runtime},
+    runtime::{Backend, MemError, MemOwn, MemRef, Runtime},
 };
 
 /// Opaque identity for one allocation generation.
@@ -76,9 +76,9 @@ pub(super) struct IpcTransport {
 }
 
 impl IpcTransport {
-    pub(super) fn load(dialect: GpuDialect) -> Result<Self, MemError> {
+    pub(super) fn load(backend: Backend) -> Result<Self, MemError> {
         Ok(Self {
-            gpu: GpuApi::load(dialect)?,
+            gpu: GpuApi::load(backend)?,
         })
     }
 
@@ -88,8 +88,8 @@ impl IpcTransport {
         }
     }
 
-    pub(super) fn dialect(&self) -> GpuDialect {
-        self.gpu.dialect()
+    pub(super) fn backend(&self) -> Backend {
+        self.gpu.backend()
     }
 
     pub(super) fn synchronize(&self) -> Result<(), MemError> {
@@ -98,7 +98,7 @@ impl IpcTransport {
 
     /// Exports a view while its owning process keeps the allocation alive.
     pub(super) fn export_view(&self, memory: MemRef<'_>) -> Result<ExportedIpcView, MemError> {
-        debug_assert_eq!(memory.dialect(), self.dialect());
+        debug_assert_eq!(memory.backend(), self.backend());
         if memory.byte_len() == 0 {
             return Ok(ExportedIpcView::empty());
         }
@@ -158,7 +158,7 @@ impl ImportedIpcAllocation {
             unsafe { self.data.cast::<u8>().add(view_offset).cast::<c_void>() }
         };
         // SAFETY: this value borrows the allocation that owns the imported mapping.
-        Some(unsafe { MemRef::from_raw_parts(data, byte_len, self.gpu.dialect(), self) })
+        Some(unsafe { MemRef::from_raw_parts(data, byte_len, self.gpu.backend(), self) })
     }
 
     /// Copies an imported view into a new allocation owned by this process.

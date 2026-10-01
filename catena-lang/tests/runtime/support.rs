@@ -28,7 +28,7 @@ pub fn runtime_with_fixture(fixture: &str) -> anyhow::Result<(Runtime, Artifact)
     let mut report = CompileReport::new(raw);
     let module = compile(&mut report, CodegenKind::Default, dialect)
         .with_context(|| format!("compiling default runtime fixture {fixture}"))?;
-    let mut runtime = Runtime::new(dialect)?;
+    let runtime = Runtime::new(dialect)?;
     let artifact = runtime.load(module)?;
     Ok((runtime, artifact))
 }

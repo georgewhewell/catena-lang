@@ -7,11 +7,21 @@ use std::{
 
 use thiserror::Error;
 
-use super::{GpuDialect, executor::CatenaMem};
+use super::{Backend, GpuDialect, executor::CatenaMem};
 use crate::gpu::GpuApi;
 
 #[derive(Debug, Error)]
 pub enum MemError {
+    #[error("no usable GPU backend (CUDA: {cuda}; HIP: {hip})")]
+    NoBackend { cuda: String, hip: String },
+    #[error("device byte range {offset}+{bytes} exceeds allocation length {length}")]
+    Range {
+        offset: u64,
+        bytes: u64,
+        length: u64,
+    },
+    #[error("no usable {backend} GPU device is available")]
+    NoDevice { backend: Backend },
     #[error(
         "failed to load {dialect:?} GPU library (tried: {tried}): {source}",
         tried = display_paths(tried)
@@ -37,6 +47,11 @@ pub enum MemError {
     },
     #[error("device memory length {byte_len} cannot be represented on this platform")]
     LengthTooLarge { byte_len: u64 },
+    #[error("{element_count} elements of {element_size} bytes overflow the allocation size")]
+    AllocationSizeOverflow {
+        element_count: usize,
+        element_size: usize,
+    },
     #[error("memory length {byte_len} is not a whole number of {element_size}-byte elements")]
     InvalidElementLength { byte_len: u64, element_size: usize },
 }
@@ -53,28 +68,28 @@ pub struct MemOwn {
 #[derive(Debug, Clone, Copy)]
 pub struct MemRef<'a> {
     pub(super) abi: CatenaMem,
-    dialect: GpuDialect,
+    backend: Backend,
     _lifetime: PhantomData<&'a ()>,
 }
 
 impl MemOwn {
     /// Copy a slice into a new device allocation.
-    pub fn from_u64_slice(values: &[u64], dialect: GpuDialect) -> Result<Self, MemError> {
-        Self::from_bytes(slice_as_bytes(values), dialect)
+    pub fn from_u64_slice(values: &[u64], backend: impl Into<Backend>) -> Result<Self, MemError> {
+        Self::from_bytes(slice_as_bytes(values), backend)
     }
 
     /// Copy a slice into a new device allocation.
-    pub fn from_u16_slice(values: &[u16], dialect: GpuDialect) -> Result<Self, MemError> {
-        Self::from_bytes(slice_as_bytes(values), dialect)
+    pub fn from_u16_slice(values: &[u16], backend: impl Into<Backend>) -> Result<Self, MemError> {
+        Self::from_bytes(slice_as_bytes(values), backend)
     }
 
     /// Copy a slice into a new device allocation.
-    pub fn from_f32_slice(values: &[f32], dialect: GpuDialect) -> Result<Self, MemError> {
-        Self::from_bytes(slice_as_bytes(values), dialect)
+    pub fn from_f32_slice(values: &[f32], backend: impl Into<Backend>) -> Result<Self, MemError> {
+        Self::from_bytes(slice_as_bytes(values), backend)
     }
 
-    fn from_bytes(bytes: &[u8], dialect: GpuDialect) -> Result<Self, MemError> {
-        let gpu = GpuApi::load(dialect)?;
+    fn from_bytes(bytes: &[u8], backend: impl Into<Backend>) -> Result<Self, MemError> {
+        let gpu = GpuApi::load(backend.into())?;
         let data = gpu.allocate(bytes.len())?;
         // SAFETY: `data` was just allocated by this same GPU API.
         let mut memory = unsafe { Self::from_raw_parts_with_gpu(data, bytes.len() as u64, gpu) };
@@ -91,17 +106,17 @@ impl MemOwn {
     /// # Safety
     ///
     /// On success, `data` must be the uniquely owned base pointer of an
-    /// allocation created by the allocator for `dialect` (or null when
+    /// allocation created by the allocator for `backend` (or null when
     /// `byte_len` is zero). It must be valid to transfer to generated Catena
-    /// code and to release with `hipFree` or `cudaFree` for that dialect.
+    /// code and to release through that backend.
     /// Imported IPC mappings therefore must not be wrapped as `MemOwn`.
     /// Ownership remains with the caller if loading the GPU runtime fails.
     pub unsafe fn from_raw_parts(
         data: *mut c_void,
         byte_len: u64,
-        dialect: GpuDialect,
+        backend: impl Into<Backend>,
     ) -> Result<Self, MemError> {
-        let gpu = GpuApi::load(dialect)?;
+        let gpu = GpuApi::load(backend.into())?;
         // SAFETY: upheld by this function's caller.
         Ok(unsafe { Self::from_raw_parts_with_gpu(data, byte_len, gpu) })
     }
@@ -123,6 +138,11 @@ impl MemOwn {
 
     /// Read this buffer into host memory, reporting copy and element-size errors.
     pub fn try_to_f32_vec(&self) -> Result<Vec<f32>, MemError> {
+        self.try_to_vec()
+    }
+
+    /// Copy the exact buffer representation without interpreting its elements.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, MemError> {
         self.try_to_vec()
     }
 
@@ -168,14 +188,19 @@ impl MemOwn {
         self.abi.len
     }
 
+    pub fn backend(&self) -> Backend {
+        self.gpu.backend()
+    }
+
+    /// The native GPU dialect, retained for existing runtime callers.
     pub fn dialect(&self) -> GpuDialect {
-        self.gpu.dialect()
+        self.backend().dialect().expect("native GPU allocation")
     }
 
     pub fn as_ref(&self) -> MemRef<'_> {
         MemRef {
             abi: self.abi,
-            dialect: self.dialect(),
+            backend: self.backend(),
             _lifetime: PhantomData,
         }
     }
@@ -190,7 +215,7 @@ impl MemOwn {
     /// # Safety
     ///
     /// The same ownership requirements as [`MemOwn::from_raw_parts`] apply,
-    /// and `data` must belong to `gpu`'s dialect.
+    /// and `data` must belong to `gpu`'s backend.
     pub(crate) unsafe fn from_raw_parts_with_gpu(
         data: *mut c_void,
         byte_len: u64,
@@ -221,6 +246,29 @@ impl Drop for MemOwn {
 }
 
 impl<'a> MemRef<'a> {
+    /// Borrow a checked byte subrange, retaining the original allocation's lifetime.
+    pub fn slice(self, offset: u64, bytes: u64) -> Result<Self, MemError> {
+        if offset
+            .checked_add(bytes)
+            .is_none_or(|end| end > self.abi.len)
+        {
+            return Err(MemError::Range {
+                offset,
+                bytes,
+                length: self.abi.len,
+            });
+        }
+        let offset =
+            usize::try_from(offset).map_err(|_| MemError::LengthTooLarge { byte_len: offset })?;
+        Ok(Self {
+            abi: CatenaMem {
+                data: self.abi.data.cast::<u8>().wrapping_add(offset).cast(),
+                len: bytes,
+            },
+            ..self
+        })
+    }
+
     /// Borrow an existing device-memory region for the lifetime of `lease`.
     ///
     /// This constructor confers no ownership and performs no alias analysis.
@@ -228,12 +276,12 @@ impl<'a> MemRef<'a> {
     /// # Safety
     ///
     /// `data..data + byte_len` must remain a valid device-memory region for
-    /// `dialect` until `lease` is no longer borrowed. `lease` must guard the
+    /// `backend` until `lease` is no longer borrowed. `lease` must guard the
     /// actual lifetime of that region.
     pub unsafe fn from_raw_parts<L: ?Sized>(
         data: *mut c_void,
         byte_len: u64,
-        dialect: GpuDialect,
+        backend: impl Into<Backend>,
         _lease: &'a L,
     ) -> Self {
         Self {
@@ -241,7 +289,7 @@ impl<'a> MemRef<'a> {
                 data,
                 len: byte_len,
             },
-            dialect,
+            backend: backend.into(),
             _lifetime: PhantomData,
         }
     }
@@ -255,8 +303,13 @@ impl<'a> MemRef<'a> {
         self.abi.len
     }
 
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    /// The native GPU dialect, retained for existing runtime callers.
     pub fn dialect(&self) -> GpuDialect {
-        self.dialect
+        self.backend.dialect().expect("native GPU reference")
     }
 }
 

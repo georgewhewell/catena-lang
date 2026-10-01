@@ -14,7 +14,7 @@
 //! use metacat::theory::RawTheorySet;
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let mut runtime = Runtime::new(GpuDialect::Hip)?;
+//!     let runtime = Runtime::new(GpuDialect::Hip)?;
 //!     let mut report = CompileReport::new(RawTheorySet::from_texts(
 //!         stdlib::sources().chain([PROGRAM]),
 //!     )?);
@@ -72,6 +72,8 @@ mod module_cache;
 
 /// Compile generated GPU C++ to a shared object.
 mod artifact;
+mod backend;
+pub use backend::Backend;
 
 /// Marshal catena values into the C ABI and invoke compiled symbols
 mod executor;

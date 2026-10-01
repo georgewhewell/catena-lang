@@ -10,6 +10,7 @@ use libloading::Library;
 use libloading::os::unix::{Library as UnixLibrary, RTLD_LAZY, RTLD_LOCAL};
 use serde::{Deserialize, Serialize};
 
+use super::Backend;
 use super::artifact::{ArtifactError, SharedObject};
 use super::executor::{AbiValue, Executor, ExecutorError};
 use super::mem::{MemError, MemOwn};
@@ -104,20 +105,29 @@ pub enum ExecError {
         expected: usize,
         actual: usize,
     },
-    #[error("Argument {index} contains device memory from a different GPU dialect")]
+    #[error("Argument {index} contains device memory from a different GPU backend")]
     IncompatibleDeviceMemory { index: usize },
 }
 
 impl Runtime {
+    /// Select a provider-local native runtime. Auto probes CUDA before HIP
+    /// and reports both failures.
+    pub fn with_backend(backend: Backend) -> Result<Self, InitError> {
+        Ok(Self {
+            gpu: GpuApi::load(backend)?,
+        })
+    }
+
+    pub fn backend(&self) -> Backend {
+        self.gpu.backend()
+    }
     pub(crate) fn gpu_api(&self) -> Arc<GpuApi> {
         self.gpu.clone()
     }
 
-    /// Create an empty runtime for the selected GPU dialect
-    pub fn new(dialect: GpuDialect) -> Result<Runtime, InitError> {
-        Ok(Self {
-            gpu: GpuApi::load(dialect)?,
-        })
+    /// Construct an empty runtime for the selected GPU backend.
+    pub fn new(backend: impl Into<Backend>) -> Result<Runtime, InitError> {
+        Self::with_backend(backend.into())
     }
 
     /// The GPU dialect used by this runtime.
@@ -126,7 +136,7 @@ impl Runtime {
     }
 
     /// Compile a rendered runtime module and load its public entry points.
-    pub fn load(&mut self, module: RuntimeModule) -> Result<Artifact, InitError> {
+    pub fn load(&self, module: RuntimeModule) -> Result<Artifact, InitError> {
         let dialect = self.gpu.dialect();
         if module.dialect != dialect {
             return Err(InitError::IncompatibleModuleDialect {
@@ -140,7 +150,7 @@ impl Runtime {
     /// Compatibility wrapper for callers that have separate source and ABI metadata.
     #[deprecated(note = "construct a RuntimeModule and call Runtime::load")]
     pub fn load_generated_source(
-        &mut self,
+        &self,
         source: &str,
         functions: impl IntoIterator<Item = GeneratedFunction>,
     ) -> Result<Artifact, InitError> {
@@ -148,7 +158,7 @@ impl Runtime {
     }
 
     fn load_generated(
-        &mut self,
+        &self,
         source: &str,
         signature_table: SignatureTable,
     ) -> Result<Artifact, InitError> {
@@ -185,19 +195,69 @@ impl Runtime {
         })
     }
 
+    /// Copy bytes into owned device memory without interpreting their contents.
+    /// The synchronous upload completes before this method returns.
+    pub fn mem_bytes(&self, bytes: &[u8]) -> Result<MemOwn, MemError> {
+        let data = self.gpu.allocate(bytes.len())?;
+        // SAFETY: this is the unique allocation returned by this GPU API.
+        // Establish its owner before copying so a failed upload also frees it.
+        let memory =
+            unsafe { MemOwn::from_raw_parts_with_gpu(data, bytes.len() as u64, self.gpu.clone()) };
+        self.gpu.copy_host_to_device(data, bytes)?;
+        Ok(memory)
+    }
+
     /// Copy `u64` values into device memory for this context.
     pub fn mem_u64(&self, values: &[u64]) -> Result<MemOwn, MemError> {
-        MemOwn::from_u64_slice(values, self.gpu.dialect())
+        MemOwn::from_u64_slice(values, self.gpu.backend())
     }
 
     /// Copy `u16` values into device memory for this context.
     pub fn mem_u16(&self, values: &[u16]) -> Result<MemOwn, MemError> {
-        MemOwn::from_u16_slice(values, self.gpu.dialect())
+        MemOwn::from_u16_slice(values, self.gpu.backend())
     }
 
     /// Copy `f32` values into device memory for this context.
     pub fn mem_f32(&self, values: &[f32]) -> Result<MemOwn, MemError> {
-        MemOwn::from_f32_slice(values, self.gpu.dialect())
+        MemOwn::from_f32_slice(values, self.gpu.backend())
+    }
+
+    /// Allocate an application-owned F32 device buffer initialized to zero.
+    pub fn mem_f32_zeroed(&self, element_count: usize) -> Result<MemOwn, MemError> {
+        let element_size = std::mem::size_of::<f32>();
+        let byte_len =
+            element_count
+                .checked_mul(element_size)
+                .ok_or(MemError::AllocationSizeOverflow {
+                    element_count,
+                    element_size,
+                })?;
+        self.mem_zeroed_bytes(byte_len as u64)
+    }
+
+    /// Allocate an application-owned BF16 device buffer initialized to zero.
+    pub fn mem_bf16_zeroed(&self, element_count: usize) -> Result<MemOwn, MemError> {
+        let element_size = std::mem::size_of::<u16>();
+        let bytes =
+            element_count
+                .checked_mul(element_size)
+                .ok_or(MemError::AllocationSizeOverflow {
+                    element_count,
+                    element_size,
+                })?;
+        self.mem_zeroed_bytes(bytes as u64)
+    }
+
+    pub(crate) fn mem_zeroed_bytes(&self, byte_len: u64) -> Result<MemOwn, MemError> {
+        let byte_len =
+            usize::try_from(byte_len).map_err(|_| MemError::LengthTooLarge { byte_len })?;
+        let data = self.gpu.allocate(byte_len)?;
+        // SAFETY: `data` is the unique allocation returned immediately above
+        // by this same GPU API, and ownership is transferred into `MemOwn`.
+        let memory =
+            unsafe { MemOwn::from_raw_parts_with_gpu(data, byte_len as u64, self.gpu.clone()) };
+        self.gpu.zero(data, byte_len)?;
+        Ok(memory)
     }
 }
 
@@ -270,13 +330,13 @@ impl Artifact {
                     actual: value.kind(),
                 });
             }
-            let memory_dialect = match value {
-                Value::MemOwn(memory) => Some(memory.dialect()),
-                Value::MemRef(memory) => Some(memory.dialect()),
+            let memory_backend = match value {
+                Value::MemOwn(memory) => Some(memory.backend()),
+                Value::MemRef(memory) => Some(memory.backend()),
                 _ => None,
             };
-            if let Some(dialect) = memory_dialect
-                && self.gpu.dialect() != dialect
+            if let Some(backend) = memory_backend
+                && self.gpu.backend() != backend
             {
                 return Err(ExecError::IncompatibleDeviceMemory { index });
             }
@@ -339,7 +399,10 @@ fn load_generated_library(path: &Path) -> Result<Library, InitError> {
     // initialization can re-register process-global LLVM command-line options and
     // abort with "Option 'ubsan-guard-checks' registered more than once".
     // RTLD_NODELETE lets the Rust handle be dropped while preventing that unload.
+    #[cfg(not(target_os = "macos"))]
     let flags = RTLD_LAZY | RTLD_LOCAL | libc::RTLD_NODELETE;
+    #[cfg(target_os = "macos")]
+    let flags = RTLD_LAZY | RTLD_LOCAL;
     let library = unsafe { UnixLibrary::open(Some(path), flags) }.map_err(|source| {
         InitError::LoadLibrary {
             path: path.to_path_buf(),
