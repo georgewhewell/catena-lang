@@ -1,10 +1,13 @@
 //! Rendering is deliberately mechanical: arrow semantics live in `ops`.
-use super::ir::*;
+use super::{ir::*, lower_types::CType};
 use crate::runtime::GpuDialect;
 use std::fmt::Write;
 
 pub(super) fn render(modules: &Modules, dialect: GpuDialect) -> String {
     let mut out = super::prelude::render(dialect);
+    if modules.bf16 {
+        out.push_str(&super::bf16_support::render(dialect, modules.bf16_dot));
+    }
     for (kernel, functions) in [(true, &modules.kernels), (false, &modules.functions)] {
         for f in functions.values() {
             let mut parameters = f
@@ -58,6 +61,15 @@ fn render_body(out: &mut String, body: &[Instruction], depth: usize, dialect: Gp
                 buffer,
                 index,
             } => {
+                if result.ty == CType::Bf16x2 {
+                    writeln!(
+                        out,
+                        "{indent}catena_bf16x2_t {} = catena_bf16_load_pair(&{}.data[{}]);",
+                        result.name, buffer.name, index.name
+                    )
+                    .unwrap();
+                    continue;
+                }
                 writeln!(
                     out,
                     "{indent}{} {} = {}.data[{}];",
@@ -73,6 +85,15 @@ fn render_body(out: &mut String, body: &[Instruction], depth: usize, dialect: Gp
                 index,
                 value,
             } => {
+                if value.ty == CType::Bf16x2 {
+                    writeln!(
+                        out,
+                        "{indent}catena_bf16_store_pair(&{}.data[{}], {});",
+                        buffer.name, index.name, value.name
+                    )
+                    .unwrap();
+                    continue;
+                }
                 writeln!(
                     out,
                     "{indent}{}.data[{}] = {};",

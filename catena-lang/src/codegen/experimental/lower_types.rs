@@ -9,6 +9,8 @@ pub(super) enum CType {
     U32,
     U64,
     F32,
+    Bf16,
+    Bf16x2,
     MemOwn,
     MemRef,
     Grid,
@@ -55,6 +57,8 @@ pub(super) fn concrete(ty: &Obj) -> Result<CType, CodegenError> {
         ("u32", []) => CType::U32,
         ("u64", []) => CType::U64,
         ("f32", []) => CType::F32,
+        ("bf16", []) => CType::Bf16,
+        ("bf16x2", []) => CType::Bf16x2,
         ("mem", [cap]) if children(cap, "cap.own") == Some(&[]) => CType::MemOwn,
         ("mem", [cap]) if children(cap, "cap.ref") == Some(&[]) => CType::MemRef,
         ("stdlib.gpu.geometry.type.Grid", [_, _]) => CType::Grid,
@@ -94,12 +98,21 @@ fn layout_len(ty: &Obj) -> Result<usize, CodegenError> {
 }
 
 impl CType {
+    pub(super) fn uses_bf16(&self) -> bool {
+        match self {
+            Self::Bf16 | Self::Bf16x2 => true,
+            Self::Global(element) | Self::Shared(element) => element.uses_bf16(),
+            _ => false,
+        }
+    }
     pub(super) fn c_name(&self) -> String {
         match self {
             Self::Bool => "uint8_t".into(),
             Self::U32 => "uint32_t".into(),
             Self::U64 => "uint64_t".into(),
             Self::F32 => "float".into(),
+            Self::Bf16 => "catena_bf16_t".into(),
+            Self::Bf16x2 => "catena_bf16x2_t".into(),
             Self::MemOwn => "catena_mem_own_t".into(),
             Self::MemRef => "catena_mem_ref_t".into(),
             Self::Grid => "catena_grid".into(),
@@ -123,7 +136,7 @@ impl CType {
         })
     }
     pub(super) fn numeric(&self) -> bool {
-        matches!(self, Self::U32 | Self::U64 | Self::F32)
+        matches!(self, Self::U32 | Self::U64 | Self::F32 | Self::Bf16)
     }
     pub(super) fn integral(&self) -> bool {
         matches!(self, Self::U32 | Self::U64)

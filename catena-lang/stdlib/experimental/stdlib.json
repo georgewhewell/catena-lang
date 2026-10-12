@@ -2,6 +2,7 @@
   "name": "stdlib",
   "files": [
     "abi.hex",
+    "bf16.hex",
     "assert.hex",
     "closure_converted.hex",
     "equality.hex",

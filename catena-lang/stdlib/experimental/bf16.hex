@@ -1,0 +1,207 @@
+# BF16 representations, shared numeric evidence and native packed dots.
+(theory type nat {
+ (arr bf16 : 0 -> 1)
+ (arr bf16x2 : 0 -> 1)
+})
+(theory program type {
+ (arr stdlib.numeric.numeric.bf16 : [] -> (({bf16} stdlib.numeric.prop.Numeric) |-))
+ (arr stdlib.numeric.signed.bf16 : [] -> (({bf16} stdlib.numeric.prop.Signed) |-))
+ (arr stdlib.numeric.floating.bf16 : [] -> (({bf16} stdlib.numeric.prop.Floating) |-))
+ (arr bf16.to-f32 : (bf16 val) -> (f32 val))
+ (arr f32.to-bf16 : (f32 val) -> (bf16 val))
+ (arr bf16x2.pack : {(bf16 val) (bf16 val)} -> (bf16x2 val))
+ (arr bf16x2.low : (bf16x2 val) -> (bf16 val))
+ (arr bf16x2.high : (bf16x2 val) -> (bf16 val))
+ (arr bf16x2.dot-f32 : {(bf16x2 val) (bf16x2 val) (f32 val)} -> (f32 val))
+
+(arr stdlib.gpu.memory.memoryelement.bf16
+    : ([] {})
+    -> ([] {(({bf16} stdlib.gpu.memory.prop.MemoryElement) |-)})
+  )
+(arr stdlib.gpu.memory.memoryelement.bf16x2
+    : ([] {})
+    -> ([] {(({bf16x2} stdlib.gpu.memory.prop.MemoryElement) |-)})
+  )
+(arr stdlib.gpu.memory.mem_cast_own_bf16
+    : ([] {(({cap.own} mem) val)})
+    -> (
+      []
+      {
+        (
+          {
+            ({[ . count__s1265] u64} :)
+            (
+              {
+                ({[ . global__s1266] ({[ . count__s1265] bf16} stdlib.gpu.memory.type.Global)} :)
+                (
+                  {
+                    (
+                      ({[ . count__s1265] bf16 [ . global__s1266]} stdlib.gpu.memory.prop.Allocation)
+                      |-
+                    )
+                    (
+                      ({[ . count__s1265] bf16 [ . global__s1266]} stdlib.gpu.memory.prop.Readable)
+                      |-
+                    )
+                  }
+                  *
+                )
+              }
+              *
+            )
+          }
+          *
+        )
+      }
+    )
+  )
+(arr stdlib.gpu.memory.mem_cast_own_bf16x2
+    : ([] {(({cap.own} mem) val)})
+    -> (
+      []
+      {
+        (
+          {
+            ({[ . count__s1265] u64} :)
+            (
+              {
+                ({[ . global__s1266] ({[ . count__s1265] bf16x2} stdlib.gpu.memory.type.Global)} :)
+                (
+                  {
+                    (
+                      ({[ . count__s1265] bf16x2 [ . global__s1266]} stdlib.gpu.memory.prop.Allocation)
+                      |-
+                    )
+                    (
+                      ({[ . count__s1265] bf16x2 [ . global__s1266]} stdlib.gpu.memory.prop.Readable)
+                      |-
+                    )
+                  }
+                  *
+                )
+              }
+              *
+            )
+          }
+          *
+        )
+      }
+    )
+  )
+(arr stdlib.gpu.memory.mem_cast_ref_bf16
+    : ([] {(({cap.ref} mem) val)})
+    -> (
+      []
+      {
+        (
+          {
+            ({[ . count__s1259] u64} :)
+            (
+              {
+                ({[ . global__s1260] ({[ . count__s1259] bf16} stdlib.gpu.memory.type.Global)} :)
+                (({[ . count__s1259] bf16 [ . global__s1260]} stdlib.gpu.memory.prop.Readable) |-)
+              }
+              *
+            )
+          }
+          *
+        )
+      }
+    )
+  )
+(arr stdlib.gpu.memory.mem_cast_ref_bf16x2
+    : ([] {(({cap.ref} mem) val)})
+    -> (
+      []
+      {
+        (
+          {
+            ({[ . count__s1259] u64} :)
+            (
+              {
+                ({[ . global__s1260] ({[ . count__s1259] bf16x2} stdlib.gpu.memory.type.Global)} :)
+                (({[ . count__s1259] bf16x2 [ . global__s1260]} stdlib.gpu.memory.prop.Readable) |-)
+              }
+              *
+            )
+          }
+          *
+        )
+      }
+    )
+  )
+(arr stdlib.gpu.memory.global_own_bf16
+    : ([count__s1028 global__s1029 . ] {(({cap.own} mem) val) ({[ . count__s1028] u64} :)})
+    -> (
+      [count__s1028 global__s1029 . ]
+      {
+        ({[ . global__s1029] ({[ . count__s1028] bf16} stdlib.gpu.memory.type.Global)} :)
+        (({[ . count__s1028] bf16 [ . global__s1029]} stdlib.gpu.memory.prop.Allocation) |-)
+        (
+          (
+            {({[ . count__s1028] bf16} stdlib.gpu.memory.type.Global) [ . global__s1029]}
+            stdlib.gpu.memory.prop.Available
+          )
+          |-
+        )
+      }
+    )
+  )
+(arr stdlib.gpu.memory.global_own_bf16x2
+    : ([count__s1028 global__s1029 . ] {(({cap.own} mem) val) ({[ . count__s1028] u64} :)})
+    -> (
+      [count__s1028 global__s1029 . ]
+      {
+        ({[ . global__s1029] ({[ . count__s1028] bf16x2} stdlib.gpu.memory.type.Global)} :)
+        (({[ . count__s1028] bf16x2 [ . global__s1029]} stdlib.gpu.memory.prop.Allocation) |-)
+        (
+          (
+            {({[ . count__s1028] bf16x2} stdlib.gpu.memory.type.Global) [ . global__s1029]}
+            stdlib.gpu.memory.prop.Available
+          )
+          |-
+        )
+      }
+    )
+  )
+(arr stdlib.gpu.memory.global_ref_bf16
+    : ([count__s1024 global__s1025 . ] {(({cap.ref} mem) val) ({[ . count__s1024] u64} :)})
+    -> (
+      [count__s1024 global__s1025 . ]
+      {
+        ({[ . global__s1025] ({[ . count__s1024] bf16} stdlib.gpu.memory.type.Global)} :)
+        (({[ . count__s1024] bf16 [ . global__s1025]} stdlib.gpu.memory.prop.Readable) |-)
+      }
+    )
+  )
+(arr stdlib.gpu.memory.global_ref_bf16x2
+    : ([count__s1024 global__s1025 . ] {(({cap.ref} mem) val) ({[ . count__s1024] u64} :)})
+    -> (
+      [count__s1024 global__s1025 . ]
+      {
+        ({[ . global__s1025] ({[ . count__s1024] bf16x2} stdlib.gpu.memory.type.Global)} :)
+        (({[ . count__s1024] bf16x2 [ . global__s1025]} stdlib.gpu.memory.prop.Readable) |-)
+      }
+    )
+  )
+(arr stdlib.gpu.memory.global_bf16_to_mem
+    : (
+      [count__s1032 memory__s1033 . ]
+      {
+        ({[ . memory__s1033] ({[ . count__s1032] bf16} stdlib.gpu.memory.type.Global)} :)
+        (({[ . count__s1032] bf16 [ . memory__s1033]} stdlib.gpu.memory.prop.Allocation) |-)
+      }
+    )
+    -> ([count__s1032 memory__s1033 . ] {(({cap.own} mem) val)})
+  )
+(arr stdlib.gpu.memory.global_bf16x2_to_mem
+    : (
+      [count__s1032 memory__s1033 . ]
+      {
+        ({[ . memory__s1033] ({[ . count__s1032] bf16x2} stdlib.gpu.memory.type.Global)} :)
+        (({[ . count__s1032] bf16x2 [ . memory__s1033]} stdlib.gpu.memory.prop.Allocation) |-)
+      }
+    )
+    -> ([count__s1032 memory__s1033 . ] {(({cap.own} mem) val)})
+  )
+})

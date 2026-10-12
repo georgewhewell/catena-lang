@@ -20,7 +20,11 @@ pub(super) fn lower(
     let xs = values.iter().map(expr).collect::<Result<Vec<_>, _>>()?;
     if matches!(
         name,
-        "memoryelement.u32" | "memoryelement.u64" | "memoryelement.f32"
+        "memoryelement.u32"
+            | "memoryelement.u64"
+            | "memoryelement.f32"
+            | "memoryelement.bf16"
+            | "memoryelement.bf16x2"
     ) {
         return outputs.iter().map(|ty| l.erased(ty)).collect();
     }
@@ -37,12 +41,23 @@ pub(super) fn lower(
     }
     if matches!(
         name,
-        "mem_cast_own_f32" | "mem_cast_own_u64" | "mem_cast_ref_f32" | "mem_cast_ref_u64"
+        "mem_cast_own_f32"
+            | "mem_cast_own_u64"
+            | "mem_cast_ref_f32"
+            | "mem_cast_ref_u64"
+            | "mem_cast_own_bf16"
+            | "mem_cast_ref_bf16"
+            | "mem_cast_own_bf16x2"
+            | "mem_cast_ref_bf16x2"
     ) {
         let [memory] = values.as_slice() else {
             return Err(invalid(op, "mem_cast requires one memory operand"));
         };
-        let element = if name.ends_with("f32") {
+        let element = if name.ends_with("bf16x2") {
+            "catena_bf16x2_t"
+        } else if name.ends_with("bf16") {
+            "catena_bf16_t"
+        } else if name.ends_with("f32") {
             "float"
         } else {
             "uint64_t"
@@ -140,7 +155,8 @@ pub(super) fn lower(
         }
         (
             "global_own_u32" | "global_own_u64" | "global_own_f32" | "global_ref_u32"
-            | "global_ref_u64" | "global_ref_f32",
+            | "global_ref_u64" | "global_ref_f32" | "global_own_bf16" | "global_ref_bf16"
+            | "global_own_bf16x2" | "global_ref_bf16x2",
             [mem, count],
         ) => {
             let Some(CType::Global(element)) = runtime(&ty)? else {
@@ -151,7 +167,14 @@ pub(super) fn lower(
                 element.c_name()
             )
         }
-        ("global_u32_to_mem" | "global_u64_to_mem" | "global_f32_to_mem", [mem]) => {
+        (
+            "global_u32_to_mem"
+            | "global_u64_to_mem"
+            | "global_f32_to_mem"
+            | "global_bf16_to_mem"
+            | "global_bf16x2_to_mem",
+            [mem],
+        ) => {
             format!("catena_mem_own_t{{{mem}.data,{mem}.bytes}}")
         }
         ("global_cast_equal_own" | "global_cast_equal_ref", [mem, count]) => {
