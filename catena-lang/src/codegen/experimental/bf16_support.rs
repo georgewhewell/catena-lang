@@ -2,19 +2,13 @@
 use crate::runtime::GpuDialect;
 
 fn native_support(dialect: GpuDialect) -> String {
-    let (header, native_type, from_f32, host_fma) = match dialect {
+    let (header, native_type, from_f32) = match dialect {
         GpuDialect::Hip => (
             "hip/hip_bf16.h",
             "__hip_bfloat16",
             "__float2bfloat16(value)",
-            "catena_bf16_t(__builtin_elementwise_fma((__bf16)a, (__bf16)b, (__bf16)c))",
         ),
-        GpuDialect::Cuda => (
-            "cuda_bf16.h",
-            "__nv_bfloat16",
-            "__float2bfloat16_rn(value)",
-            "__float2bfloat16_rn(fmaf(__bfloat162float(a), __bfloat162float(b), __bfloat162float(c)))",
-        ),
+        GpuDialect::Cuda => ("cuda_bf16.h", "__nv_bfloat16", "__float2bfloat16_rn(value)"),
     };
     format!(
         r#"#include <{header}>
@@ -34,16 +28,7 @@ __host__ __device__ static inline catena_bf16_t catena_u16_bitcast_bf16(uint16_t
 __host__ __device__ static inline uint16_t catena_bf16_bitcast_u16(catena_bf16_t value) {{
     return __bfloat16_as_ushort(value);
 }}
-__host__ __device__ static inline catena_bf16_t catena_bf16_fma(catena_bf16_t a, catena_bf16_t b, catena_bf16_t c) {{
-#ifdef {device_compile_guard}
-    return __hfma(a, b, c);
-#elif defined(CATENA_BF16_CPU_EMULATION)
-    return __hfma(a, b, c);
-#else
-    return {host_fma};
-#endif
-}}"#,
-        device_compile_guard = dialect.device_compile_guard(),
+"#,
     )
 }
 
@@ -56,6 +41,8 @@ __host__ __device__ inline catena_bf16_t catena_bf16_mul(catena_bf16_t a,catena_
 __host__ __device__ inline catena_bf16_t catena_bf16_div(catena_bf16_t a,catena_bf16_t b) { return __hdiv(a,b); }
 __host__ __device__ inline catena_bf16_t catena_bf16_neg(catena_bf16_t a) { return __hneg(a); }
 __device__ inline catena_bf16_t catena_bf16_exp(catena_bf16_t a) { return hexp(a); }
+__device__ inline catena_bf16_t catena_bf16_sqrt(catena_bf16_t a) { return hsqrt(a); }
+__device__ inline catena_bf16_t catena_bf16_rsqrt(catena_bf16_t a) { return hrsqrt(a); }
 struct alignas(4) catena_bf16x2_t { uint32_t bits; };
 static_assert(sizeof(catena_bf16x2_t)==4 && alignof(catena_bf16x2_t)==4,"packed BF16 must occupy four aligned bytes");
 // Byte copies permit packed access to storage previously written as BF16 scalars.

@@ -9,7 +9,6 @@ pub(super) enum CType {
     U32,
     U64,
     F32,
-    U16,
     Bf16,
     Bf16x2,
     MemOwn,
@@ -58,7 +57,6 @@ pub(super) fn concrete(ty: &Obj) -> Result<CType, CodegenError> {
         ("u32", []) => CType::U32,
         ("u64", []) => CType::U64,
         ("f32", []) => CType::F32,
-        ("u16", []) => CType::U16,
         ("bf16", []) => CType::Bf16,
         ("bf16x2", []) => CType::Bf16x2,
         ("mem", [cap]) if children(cap, "cap.own") == Some(&[]) => CType::MemOwn,
@@ -113,7 +111,6 @@ impl CType {
             Self::U32 => "uint32_t".into(),
             Self::U64 => "uint64_t".into(),
             Self::F32 => "float".into(),
-            Self::U16 => "uint16_t".into(),
             Self::Bf16 => "catena_bf16_t".into(),
             Self::Bf16x2 => "catena_bf16x2_t".into(),
             Self::MemOwn => "catena_mem_own_t".into(),
@@ -139,7 +136,7 @@ impl CType {
         })
     }
     pub(super) fn numeric(&self) -> bool {
-        matches!(self, Self::U32 | Self::U64 | Self::F32)
+        matches!(self, Self::U32 | Self::U64 | Self::F32 | Self::Bf16)
     }
     pub(super) fn integral(&self) -> bool {
         matches!(self, Self::U32 | Self::U64)

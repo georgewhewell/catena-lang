@@ -22,9 +22,12 @@ pub(super) fn lower(
             | "stdlib.numeric.numeric.u32"
             | "stdlib.numeric.numeric.u64"
             | "stdlib.numeric.numeric.f32"
+            | "stdlib.numeric.numeric.bf16"
             | "stdlib.numeric.signed.int"
             | "stdlib.numeric.signed.f32"
+            | "stdlib.numeric.signed.bf16"
             | "stdlib.numeric.floating.f32"
+            | "stdlib.numeric.floating.bf16"
     ) {
         return outputs.iter().map(|t| l.erased(t)).collect();
     }
@@ -72,6 +75,7 @@ pub(super) fn lower(
             ("bool.f", []) => "0".into(),
             ("bool.and", [x, y]) => format!("{x} && {y}"),
             ("bool.or", [x, y]) => format!("{x} || {y}"),
+            ("zero", []) if out == CType::Bf16 => "catena_u16_bitcast_bf16(0)".into(),
             ("zero", []) if out.numeric() => "0".into(),
             ("numeric_size", []) if out == CType::U32 => {
                 let element = args
@@ -83,7 +87,9 @@ pub(super) fn lower(
                             .and_then(|p| p.first())
                     })
                     .ok_or_else(|| invalid(op, "missing Numeric evidence"))?;
-                format!("sizeof({})", concrete(element)?.c_name())
+                let element = concrete(element)?;
+                l.modules.bf16 |= element.uses_bf16();
+                format!("sizeof({})", element.c_name())
             }
             ("coerce", [x]) if runtime(&values[0].ty)? == Some(CType::U32) && out == CType::U64 => {
                 format!("uint64_t({x})")
@@ -92,6 +98,19 @@ pub(super) fn lower(
                 if runtime(&values[0].ty)? == Some(CType::U32) && out == CType::F32 =>
             {
                 format!("float({x})")
+            }
+            ("exp" | "sqrt" | "rsqrt", [x])
+                if runtime(&values[0].ty)? == Some(CType::Bf16) && out == CType::Bf16 =>
+            {
+                if l.place != Place::Device {
+                    return Err(invalid(op, "BF16 transcendental requires device execution"));
+                }
+                format!("catena_bf16_{name}({x})")
+            }
+            ("negate", [x])
+                if out == CType::Bf16 && runtime(&values[0].ty)? == Some(CType::Bf16) =>
+            {
+                format!("catena_bf16_neg({x})")
             }
             ("exp" | "sqrt" | "rsqrt", [x])
                 if runtime(&values[0].ty)? == Some(CType::F32) && out == CType::F32 =>
@@ -143,6 +162,18 @@ pub(super) fn lower(
                     l.body.push(Instruction::Assert {
                         condition: format!("{y} != 0"),
                     });
+                }
+                // BF16 SDK calls preserve rounding at each arithmetic boundary.
+                // Comparisons/min/max share the normal expression renderer.
+                if input == CType::Bf16 && matches!(name, "+" | "-" | "*" | "/") {
+                    let helper = match name {
+                        "+" => "add",
+                        "-" => "sub",
+                        "*" => "mul",
+                        _ => "div",
+                    };
+                    let value = l.emit(&ty, format!("catena_bf16_{helper}({x},{y})"))?;
+                    return results(l, outputs, vec![value]);
                 }
                 match name {
                     "min" => format!("({x} < {y} ? {x} : {y})"),
