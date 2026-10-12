@@ -95,6 +95,7 @@ impl<'a> Lowerer<'a> {
         let ctype = runtime(ty)?.ok_or_else(|| {
             CodegenError::Type(format!("runtime expression has erased type {ty:?}"))
         })?;
+        self.modules.bf16 |= ctype.uses_bf16();
         let name = self.fresh("v");
         self.body.push(Instruction::Let(
             Variable {
@@ -123,6 +124,7 @@ impl<'a> Lowerer<'a> {
             ));
         }
         if let Some(ctype) = runtime(ty)? {
+            self.modules.bf16 |= ctype.uses_bf16();
             let name = self.fresh("arg");
             parameters.push(Variable {
                 name: name.clone(),

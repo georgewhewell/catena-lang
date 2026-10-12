@@ -3,6 +3,7 @@
 //! The compiler also reads callback aliases from `primitives`. Lowering, IR,
 //! and rendering are private to this module and its descendants.
 
+mod bf16_support;
 mod gpu;
 mod ir;
 mod lower;
@@ -256,6 +257,12 @@ fn render_runtime_module(
     modules: &Modules,
     dialect: GpuDialect,
 ) -> Result<RuntimeModule, CodegenError> {
+    if modules.bf16_dot && dialect == GpuDialect::Cuda {
+        return Err(invalid(
+            "bf16x2.dot-f32",
+            "native packed BF16 dot requires HIP gfx11",
+        ));
+    }
     validate::validate(modules)?;
     Ok(RuntimeModule::new(
         dialect,

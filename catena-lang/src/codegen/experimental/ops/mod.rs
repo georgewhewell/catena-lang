@@ -1,6 +1,7 @@
 //! Explicit primitive dispatch. Never erase an unknown arrow merely because its
 //! result is a proof: assertions, writes and barriers have erased results too.
 mod barriers;
+mod bf16;
 pub(super) mod control;
 mod geometry;
 pub(super) mod launch;
@@ -22,6 +23,13 @@ pub(super) fn lower(
     args: Vec<Value>,
     outputs: &[Obj],
 ) -> Result<Vec<Value>, CodegenError> {
+    if op.starts_with("bf16.")
+        || op.starts_with("bf16x2.")
+        || matches!(op, "f32.to-bf16" | "u16.bitcast-bf16")
+    {
+        l.modules.bf16 = true;
+        return bf16::lower(l, op, &args, outputs);
+    }
     if op.starts_with("stdlib.numeric.")
         || op.starts_with("type.const.")
         || op.starts_with("const.")

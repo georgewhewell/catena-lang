@@ -81,3 +81,5 @@ dependencies as follows:
 ```sh
 nix develop --command cargo run -p catena-lang --example runtime
 ```
+
+Experimental backend [BF16 support and precision rules](BF16.md).

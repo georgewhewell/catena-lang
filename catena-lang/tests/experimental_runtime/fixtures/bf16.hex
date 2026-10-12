@@ -1,0 +1,157 @@
+# BF16 typed memory and a geometry-scoped native dot callback.
+# Master-compatible scalar and memory adapters, composed only in Hex.
+# Index bounds are checked by native typed accesses. GlobalOwn is trusted: linear
+# launches give each output element one writer, and owners outlive their uses.
+(theory type nat {
+(arr testbf16.left : 0 -> 1)
+(arr testbf16.right : 0 -> 1)
+(arr testbf16.value : 0 -> 1)
+(arr testbf16.count : 0 -> 1)
+(arr testbf16.memory : 0 -> 1)
+(arr testbf16.index : 0 -> 1)
+(arr testbf16.end : 0 -> 1)
+(arr testbf16.predicate : 0 -> 1)
+(arr testbf16.blocks : 0 -> 1)
+(arr testbf16.threads : 0 -> 1)
+(arr testbf16.one : 0 -> 1)
+(arr testbf16.grid : 0 -> 1)
+(arr testbf16.block : 0 -> 1)
+(arr testbf16.thread : 0 -> 1)
+(arr testbf16.phase : 0 -> 1)
+})
+(theory program type {
+(arr meta.testbf16.count : 1 -> testbf16.count)
+(arr meta.testbf16.index : 1 -> testbf16.index)
+(arr meta.testbf16.blocks : 1 -> testbf16.blocks)
+(arr meta.testbf16.threads : 1 -> testbf16.threads)
+(arr meta.testbf16.one : 1 -> testbf16.one)
+(arr meta.testbf16.grid : 1 -> testbf16.grid)
+(arr meta.testbf16.block : 1 -> testbf16.block)
+(arr meta.testbf16.thread : 1 -> testbf16.thread)
+(arr meta.testbf16.bf16-instantiate.1 : {1} -> {1 ({testbf16.index testbf16.count} prop.Less)})
+(arr meta.testbf16.bf16-instantiate.3 : {((cap.own mem) val) ({testbf16.count u64} :)} -> {({((cap.own mem) val) ({testbf16.count u64} :)} *) testbf16.count testbf16.memory})
+(arr meta.testbf16.bf16-instantiate.4 : {1} -> {1 ({testbf16.index testbf16.count} prop.Less)})
+(arr meta.testbf16.bf16-instantiate.5 : {({testbf16.index u64} :) (({testbf16.index testbf16.count} prop.Less) |-)} -> {({({testbf16.index u64} :) (({testbf16.index testbf16.count} prop.Less) |-)} *) testbf16.count testbf16.index})
+(arr meta.testbf16.bf16-instantiate.12 : {((cap.own mem) val) ({testbf16.count u64} :)} -> {({((cap.own mem) val) ({testbf16.count u64} :)} *) testbf16.count testbf16.memory})
+(arr meta.testbf16.bf16-instantiate.13 : {1} -> {1 ({testbf16.index testbf16.count} prop.Less)})
+(arr meta.testbf16.bf16-instantiate.14 : {({testbf16.index u64} :) (({testbf16.index testbf16.count} prop.Less) |-)} -> {({({testbf16.index u64} :) (({testbf16.index testbf16.count} prop.Less) |-)} *) testbf16.count testbf16.index})
+(arr meta.testbf16.bf16-instantiate.15 : {1} -> {1 ({({testbf16.blocks testbf16.one} stdlib.gpu.geometry.sort.D2) ({testbf16.threads testbf16.one} stdlib.gpu.geometry.sort.D2) testbf16.grid testbf16.block testbf16.count bf16 testbf16.thread testbf16.memory ({testbf16.count testbf16.index} stdlib.gpu.memory.sort.At)} stdlib.gpu.memory.prop.GlobalOwn)})
+(arr meta.testbf16.bf16-instantiate.16 : {({testbf16.memory ({testbf16.count bf16} stdlib.gpu.memory.type.Global)} :) ({({testbf16.count testbf16.index} stdlib.gpu.memory.sort.At) ({testbf16.count} stdlib.gpu.memory.type.Ix)} :) (bf16 val) (({({testbf16.blocks testbf16.one} stdlib.gpu.geometry.sort.D2) ({testbf16.threads testbf16.one} stdlib.gpu.geometry.sort.D2) testbf16.grid testbf16.block testbf16.count bf16 testbf16.thread testbf16.memory ({testbf16.count testbf16.index} stdlib.gpu.memory.sort.At)} stdlib.gpu.memory.prop.GlobalOwn) |-)} -> {({({testbf16.memory ({testbf16.count bf16} stdlib.gpu.memory.type.Global)} :) ({({({testbf16.count testbf16.index} stdlib.gpu.memory.sort.At) ({testbf16.count} stdlib.gpu.memory.type.Ix)} :) ({(bf16 val) (({({testbf16.blocks testbf16.one} stdlib.gpu.geometry.sort.D2) ({testbf16.threads testbf16.one} stdlib.gpu.geometry.sort.D2) testbf16.grid testbf16.block testbf16.count bf16 testbf16.thread testbf16.memory ({testbf16.count testbf16.index} stdlib.gpu.memory.sort.At)} stdlib.gpu.memory.prop.GlobalOwn) |-)} *)} *)} *) bf16 ({testbf16.blocks testbf16.one} stdlib.gpu.geometry.sort.D2) ({testbf16.threads testbf16.one} stdlib.gpu.geometry.sort.D2) testbf16.grid testbf16.block testbf16.thread testbf16.count testbf16.memory ({testbf16.count testbf16.index} stdlib.gpu.memory.sort.At)})
+})
+(def program stdlib.test.bf16.grid : {(u64 val)} -> ({testbf16.grid ({({testbf16.blocks testbf16.one} stdlib.gpu.geometry.sort.D2) ({testbf16.threads testbf16.one} stdlib.gpu.geometry.sort.D2)} stdlib.gpu.geometry.type.Grid)} :) =
+ ([blocks.]
+  ([.] unit.intro meta.testbf16.blocks [x0.])
+  ([.blocks x0] smolcat.value.named_at [x1.])
+  ([.] const.u64.0x0000000000000001 [x2.])
+  ([.] unit.intro meta.testbf16.one [x3.])
+  ([.x2 x3] smolcat.value.named_at [x4.])
+  ([.] const.u64.0x0000000000000100 [x5.])
+  ([.] unit.intro meta.testbf16.threads [x6.])
+  ([.x5 x6] smolcat.value.named_at [x7.])
+  ([.] const.u64.0x0000000000000001 [x8.])
+  ([.] unit.intro meta.testbf16.one [x9.])
+  ([.x8 x9] smolcat.value.named_at [x10.])
+  ([.x1 x4 x7 x10] stdlib.gpu.geometry.make_grid [x11 x12.])
+  ([.x12] unsafe.discard unit.elim)
+  ([.x11] :.forget [x13.])
+  ([.] unit.intro meta.testbf16.grid [x14.])
+  ([.x13 x14] smolcat.value.named_at [x15.])
+  [. x15]
+ ))
+
+(def program stdlib.test.bf16.thread-index : {({({testbf16.block ({({testbf16.blocks testbf16.one} stdlib.gpu.geometry.sort.D2) ({testbf16.threads testbf16.one} stdlib.gpu.geometry.sort.D2) testbf16.grid} stdlib.gpu.geometry.type.Block)} :) (({({testbf16.blocks testbf16.one} stdlib.gpu.geometry.sort.D2) ({testbf16.threads testbf16.one} stdlib.gpu.geometry.sort.D2) testbf16.grid testbf16.block} stdlib.gpu.geometry.type.Thread) val)} *)} -> (u64 val) =
+ ([pair.]
+  ([.pair] *.elim [x0 x1.])
+  ([.] unit.intro meta.testbf16.thread [x2.])
+  ([.x1 x2] smolcat.value.named_at [x3.])
+  ([.x3] stdlib.gpu.geometry.in_grid_index stdlib.gpu.geometry.x :.forget [x4.])
+  [. x4]
+ ))
+
+(def program stdlib.test.bf16.own-count-bf16 : {((cap.own mem) val)} -> (u64 val) =
+ ([memory.]
+  ([.memory] stdlib.gpu.memory.mem_cast_own_bf16 [x0.])
+  ([.x0] *.elim [x1 x2.])
+  ([.x2] *.elim [x3 x4.])
+  ([.x4] *.elim [x5 x6.])
+  ([.x5] unsafe.discard unit.elim)
+  ([.x6] unsafe.discard unit.elim)
+  ([.x1] :.forget [x7.])
+  [. x7]
+ ))
+
+(def program stdlib.test.bf16.own-count-bf16x2 : {((cap.own mem) val)} -> (u64 val) =
+ ([memory.]
+  ([.memory] stdlib.gpu.memory.mem_cast_own_bf16x2 [x0.])
+  ([.x0] *.elim [x1 x2.])
+  ([.x2] *.elim [x3 x4.])
+  ([.x4] *.elim [x5 x6.])
+  ([.x5] unsafe.discard unit.elim)
+  ([.x6] unsafe.discard unit.elim)
+  ([.x1] :.forget [x7.])
+  [. x7]
+ ))
+
+(def program stdlib.test.bf16.own-read-bf16x2 : {((cap.own mem) val) (u64 val)} -> (bf16x2 val) =
+ ([memory index.]
+  ([.memory] stdlib.test.bf16.own-count-bf16x2 [x0.])
+  ([.] unit.intro meta.testbf16.count [x1.])
+  ([.x0 x1] smolcat.value.named_at [x2.])
+  ([.memory x2] (meta.testbf16.bf16-instantiate.3 {{_} (name.stdlib.gpu.memory.global_own_bf16x2 lift)} evaluate {_}) [x3.])
+  ([.x3] *.elim [x4 x5.])
+  ([.x5] *.elim [x6 x7.])
+  ([.x6] unsafe.discard unit.elim)
+  ([.x7] unsafe.discard unit.elim)
+  ([.] unit.intro meta.testbf16.index [x8.])
+  ([.index x8] smolcat.value.named_at [x9.])
+  ([.] unit.intro [x10.])
+  ([.x10] (meta.testbf16.bf16-instantiate.4 {{_} (name.unsafe.assume lift)} evaluate {_}) [x11.])
+  ([.x9 x11] (meta.testbf16.bf16-instantiate.5 {{_} (name.stdlib.gpu.memory.ix lift)} evaluate {_}) [x12.])
+  ([.x4] :.forget [x13.])
+  ([.x12] :.forget [x14.])
+  ([.x13 x14] stdlib.gpu.memory.global_read_unsafe [x15.])
+  [. x15]
+ ))
+
+(def program stdlib.test.bf16.write-bf16 : {((cap.own mem) val) (u64 val) (bf16 val)} -> 1 =
+ ([memory index value.]
+  ([.memory] stdlib.test.bf16.own-count-bf16 [x0.])
+  ([.] unit.intro meta.testbf16.count [x1.])
+  ([.x0 x1] smolcat.value.named_at [x2.])
+  ([.memory x2] (meta.testbf16.bf16-instantiate.12 {{_} (name.stdlib.gpu.memory.global_own_bf16 lift)} evaluate {_}) [x3.])
+  ([.x3] *.elim [x4 x5.])
+  ([.x5] *.elim [x6 x7.])
+  ([.x6] unsafe.discard unit.elim)
+  ([.x7] unsafe.discard unit.elim)
+  ([.] unit.intro meta.testbf16.index [x8.])
+  ([.index x8] smolcat.value.named_at [x9.])
+  ([.] unit.intro [x10.])
+  ([.x10] (meta.testbf16.bf16-instantiate.13 {{_} (name.unsafe.assume lift)} evaluate {_}) [x11.])
+  ([.x9 x11] (meta.testbf16.bf16-instantiate.14 {{_} (name.stdlib.gpu.memory.ix lift)} evaluate {_}) [x12.])
+  ([.] unit.intro [x13.])
+  ([.x13] (meta.testbf16.bf16-instantiate.15 {{_} (name.unsafe.assume lift)} evaluate {_}) [x14.])
+  ([.x4 x12 value x14] (meta.testbf16.bf16-instantiate.16 {{_} (name.stdlib.gpu.memory.global_write lift)} evaluate {_}) [x15.])
+  [. x15]
+ ))
+(def program stdlib.test.bf16.kernel : {((cap.own mem) val) ((cap.own mem) val) ({({testbf16.block ({({testbf16.blocks testbf16.one} stdlib.gpu.geometry.sort.D2) ({testbf16.threads testbf16.one} stdlib.gpu.geometry.sort.D2) testbf16.grid} stdlib.gpu.geometry.type.Block)} :) (({({testbf16.blocks testbf16.one} stdlib.gpu.geometry.sort.D2) ({testbf16.threads testbf16.one} stdlib.gpu.geometry.sort.D2) testbf16.grid testbf16.block} stdlib.gpu.geometry.type.Thread) val)} *)} -> 1 =
+ ([input output pair.]
+  ([.pair] stdlib.test.bf16.thread-index [x0.])
+  ([.input x0] stdlib.test.bf16.own-read-bf16x2 [x1.])
+  ([.x1] bf16x2.low [x2.])
+  ([.x1] bf16x2.high [x3.])
+  ([.x2 x3] bf16.add [x4.])
+  ([.x4] bf16.exp [x5.])
+  ([.x5] bf16.to-f32 [x6.])
+  ([.x1 x1 x6] bf16x2.dot-f32 [x7.])
+  ([.x7] f32.to-bf16 [x8.])
+  ([.output x0 x8] stdlib.test.bf16.write-bf16 [x9.])
+  [. x9]
+ ))
+(def program main : {((cap.own mem) val) ((cap.own mem) val)} -> 1 =
+ ([input output.]
+  ([.] const.u64.0x0000000000000001 [x0.])
+  ([.x0] stdlib.test.bf16.grid [x1.])
+  ([.input output] partial.stdlib.test.bf16.kernel.2 [x2.])
+  ([.x1 x2] unsafe.launch [unit.])
+  [. unit]
+ ))
