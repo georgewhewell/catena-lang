@@ -39,6 +39,9 @@ pub(super) fn render(modules: &Modules, dialect: GpuDialect) -> String {
             }
             render_body(&mut out, &f.body, 1, dialect);
             out.push_str("}\n");
+            if let Some(checks) = modules.argument_checks.get(&f.symbol) {
+                super::abi::render_argument_check(&mut out, f, checks, dialect);
+            }
         }
     }
     out

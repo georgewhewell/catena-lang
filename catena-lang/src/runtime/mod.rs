@@ -95,5 +95,6 @@ pub use mem::MemRef;
 pub use module_cache::ModuleCache;
 pub use runtime::{Artifact, ExecError, InitError, Runtime};
 pub use runtime_module::{GeneratedFunction, RuntimeModule};
+pub use signature::EntryPoint;
 pub use value::Value;
 pub use value::ValueKind;

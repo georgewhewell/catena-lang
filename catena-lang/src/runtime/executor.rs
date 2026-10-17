@@ -55,6 +55,14 @@ impl AbiValue {
 struct PreparedFunction {
     code: CodePtr,
     cif: Cif,
+    /// The module's optional validation of this entry point's arguments.
+    check: Option<PreparedCall>,
+}
+
+#[derive(Debug)]
+struct PreparedCall {
+    code: CodePtr,
+    cif: Cif,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,18 +152,25 @@ impl Executor {
                 },
             )?;
 
-            let argument_types = signature
-                .inputs
-                .iter()
-                .copied()
-                .map(ffi_type)
+            let input_types = signature.inputs.iter().copied().map(ffi_type);
+            let argument_types = input_types
+                .clone()
                 .chain(signature.outputs.iter().map(|_| Type::pointer()))
                 .collect::<Vec<_>>();
+            let check = optional_symbol::<*mut c_void>(
+                &library,
+                &module_abi::argument_check_symbol(&signature.symbol),
+            )
+            .map(|code| PreparedCall {
+                code: CodePtr(code),
+                cif: Cif::new(input_types, Type::i64()),
+            });
             functions.insert(
                 signature.symbol.clone(),
                 PreparedFunction {
                     code: CodePtr(*function),
                     cif: Cif::new(argument_types, Type::void()),
+                    check,
                 },
             );
         }
@@ -192,6 +207,32 @@ impl Executor {
 
     pub(super) fn supports_allocation_budget(&self) -> bool {
         self.allocation_budget.is_some()
+    }
+
+    /// Run the module's argument check for `symbol`, if it provides one, and
+    /// return the index of the first rejected argument. Inputs are only read.
+    /// A result naming no argument is returned as `Err`.
+    pub(super) fn rejected_argument(
+        &self,
+        symbol: &str,
+        inputs: &[AbiValue],
+    ) -> Result<Option<usize>, i64> {
+        let Some(check) = &self
+            .functions
+            .get(symbol)
+            .expect("source signature should have a prepared generated function")
+            .check
+        else {
+            return Ok(None);
+        };
+        let arguments = inputs.iter().map(input_arg).collect::<Vec<_>>();
+        match unsafe { check.cif.call::<i64>(check.code, &arguments) } {
+            -1 => Ok(None),
+            index if usize::try_from(index).is_ok_and(|index| index < inputs.len()) => {
+                Ok(Some(index as usize))
+            }
+            result => Err(result),
+        }
     }
 
     /// Mark a generated call in progress on this thread, or return `None` if one
@@ -287,17 +328,50 @@ mod tests {
         END_COUNT.fetch_add(1, Ordering::SeqCst);
     }
 
+    unsafe extern "C" fn echo_check(result: u64) -> i64 {
+        result as i64
+    }
+
+    unsafe extern "C" fn unreachable_entry() {
+        unreachable!("tests only run the argument check");
+    }
+
+    fn executor_with_check() -> Executor {
+        let mut functions = HashMap::new();
+        functions.insert(
+            "entry".to_string(),
+            PreparedFunction {
+                code: CodePtr(unreachable_entry as *mut c_void),
+                cif: Cif::new([Type::u64()], Type::void()),
+                check: Some(PreparedCall {
+                    code: CodePtr(echo_check as *mut c_void),
+                    cif: Cif::new([Type::u64()], Type::i64()),
+                }),
+            },
+        );
+        Executor {
+            _library: libloading::os::unix::Library::this().into(),
+            functions,
+            allocation_budget: None,
+        }
+    }
+
+    #[test]
+    fn argument_check_results_must_name_an_argument_or_accept() {
+        let executor = executor_with_check();
+        let check =
+            |result: i64| executor.rejected_argument("entry", &[AbiValue::U64(result as u64)]);
+        assert_eq!(check(-1), Ok(None));
+        assert_eq!(check(0), Ok(Some(0)));
+        assert_eq!(check(1), Err(1));
+        assert_eq!(check(-2), Err(-2));
+        assert_eq!(check(i64::MIN), Err(i64::MIN));
+    }
+
     #[test]
     fn an_executor_cannot_be_entered_twice_on_one_thread() {
-        let load = || {
-            Executor::new(
-                libloading::os::unix::Library::this().into(),
-                &SignatureTable::new(),
-            )
-            .unwrap()
-        };
-        let executor = load();
-        let other = load();
+        let executor = executor_with_check();
+        let other = executor_with_check();
         let outer = executor.enter().expect("first entry");
         assert!(executor.enter().is_none());
         // Another module keeps separate invocation state.

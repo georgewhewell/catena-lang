@@ -40,6 +40,51 @@ fn default_codegen_uses_shared_passes_and_dispatch() -> anyhow::Result<()> {
 }
 
 #[test]
+fn runtime_modules_advertise_only_checkable_foreign_entry_points() -> anyhow::Result<()> {
+    let raw = RawTheorySet::from_texts(
+        catena_lang::stdlib::sources().chain([include_str!("cases/abi-refinements.hex")]),
+    )?;
+    let mut report = CompileReport::new(raw);
+    let module = compile(&mut report, codegen::CodegenKind::Default, GpuDialect::Hip)?;
+    let function = |name: &str| {
+        module
+            .functions
+            .iter()
+            .find(|function| function.source_name == name)
+    };
+    let check_symbol = |name: &str| {
+        let entry = function(name).unwrap_or_else(|| panic!("{name} should be exported"));
+        module_abi::argument_check_symbol(&entry.symbol)
+    };
+
+    for name in ["checked-named-bool"] {
+        let entry = function(name).unwrap_or_else(|| panic!("{name} should be exported"));
+        assert_eq!(entry.inputs, [ValueKind::Bool]);
+        assert!(entry.outputs.is_empty());
+    }
+    // Refined entry points carry their own check; unrefined ones need none.
+    for name in ["checked-index", "checked-matrix-size", "checked-zero"] {
+        assert!(
+            module
+                .source
+                .contains(&format!("int64_t {}(", check_symbol(name)))
+        );
+    }
+    for name in ["canonical-bool", "checked-named-bool"] {
+        assert!(!module.source.contains(&check_symbol(name)));
+    }
+    for name in [
+        "erased-index-bound",
+        "erased-proof",
+        "constant-named-u32",
+        "repeated-named-bool",
+    ] {
+        assert!(function(name).is_none(), "{name} must not be exported");
+    }
+    Ok(())
+}
+
+#[test]
 fn every_code_generator_exports_the_runtime_services() -> anyhow::Result<()> {
     let codegen = codegen::CodegenKind::Default;
     let sources = catena_lang::stdlib::sources().collect::<Vec<_>>();

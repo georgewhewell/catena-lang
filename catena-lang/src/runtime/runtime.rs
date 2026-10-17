@@ -16,7 +16,9 @@ use super::executor::{AbiValue, Executor, ExecutorError};
 use super::mem::{MemError, MemOwn};
 use super::{
     GeneratedFunction, GpuDialect, RuntimeModule,
-    signature::{FunctionSignature, SignatureTable, generated_signatures},
+    signature::{
+        EntryPoint, FunctionSignature, SignatureTable, entry_points, generated_signatures,
+    },
     value::{Value, ValueKind},
 };
 use crate::gpu::GpuApi;
@@ -36,9 +38,8 @@ pub struct Runtime {
 pub struct Artifact {
     /// GPU operations used to validate and release memory crossing the ABI.
     gpu: Arc<GpuApi>,
-    // Keep the tempdir-backed shared object alive for as long as the library is loaded.
+    entry_points: Vec<EntryPoint>,
     _shared_object: SharedObject,
-    /// Prepared entry points in the loaded shared object.
     executor: Executor,
     /// Function signatures (runtime Rust ↔ C typechecking)
     signatures: SignatureTable,
@@ -107,8 +108,12 @@ pub enum ExecError {
     },
     #[error("Argument {index} contains device memory from a different GPU backend")]
     IncompatibleDeviceMemory { index: usize },
+    #[error("Argument {index} violates its dependent input type")]
+    InvalidArgumentRefinement { index: usize },
     #[error("artifact does not provide generated-device-allocation controls")]
     AllocationBudgetUnavailable,
+    #[error("argument check returned {result}, which names no argument")]
+    InvalidArgumentCheck { result: i64 },
     #[error(
         "an artifact cannot be called again while one of its calls is in progress on this thread"
     )]
@@ -198,6 +203,7 @@ impl Runtime {
         })?;
         Ok(Artifact {
             gpu: self.gpu.clone(),
+            entry_points: entry_points(&signature_table),
             _shared_object: shared_object,
             executor,
             signatures: signature_table,
@@ -271,6 +277,11 @@ impl Runtime {
 }
 
 impl Artifact {
+    /// Source-level entry signatures for this artifact, sorted by name.
+    pub fn entry_points(&self) -> &[EntryPoint] {
+        &self.entry_points
+    }
+
     /// Run a source-level `program` definition.
     pub fn exec<'a, const M: usize, const N: usize>(
         &self,
@@ -384,6 +395,9 @@ impl Artifact {
                     actual: value.kind(),
                 });
             }
+            if matches!(value, Value::Bool(value) if *value > 1) {
+                return Err(ExecError::InvalidArgumentRefinement { index });
+            }
             let memory_backend = match value {
                 Value::MemOwn(memory) => Some(memory.backend()),
                 Value::MemRef(memory) => Some(memory.backend()),
@@ -394,6 +408,18 @@ impl Artifact {
             {
                 return Err(ExecError::IncompatibleDeviceMemory { index });
             }
+        }
+
+        // The module's own argument check only reads the inputs, so it runs
+        // while the caller still owns them.
+        let borrowed = args.iter().map(abi_view).collect::<Vec<_>>();
+        match self
+            .executor
+            .rejected_argument(&signature.symbol, &borrowed)
+        {
+            Ok(None) => {}
+            Ok(Some(index)) => return Err(ExecError::InvalidArgumentRefinement { index }),
+            Err(result) => return Err(ExecError::InvalidArgumentCheck { result }),
         }
 
         let executor = &self.executor;
@@ -456,6 +482,19 @@ impl Artifact {
                 Ok(Value::from(memory))
             }
         }
+    }
+}
+
+/// A non-owning view of an argument for checks that only read it.
+fn abi_view(value: &Value<'_>) -> AbiValue {
+    match value {
+        Value::Bool(value) => AbiValue::Bool(*value),
+        Value::U16(value) => AbiValue::U16(*value),
+        Value::U32(value) => AbiValue::U32(*value),
+        Value::U64(value) => AbiValue::U64(*value),
+        Value::F32(value) => AbiValue::F32(*value),
+        Value::MemOwn(memory) => AbiValue::Mem(memory.abi),
+        Value::MemRef(memory) => AbiValue::Mem(memory.abi),
     }
 }
 

@@ -3,6 +3,7 @@
 //! The compiler also reads callback aliases from `primitives`. Lowering, IR,
 //! and rendering are private to this module and its descendants.
 
+mod abi;
 mod bf16_support;
 mod gpu;
 mod ir;
@@ -137,6 +138,9 @@ fn lower_to_ir(terms: &super::CodegenTermMap) -> Result<Modules, CodegenError> {
         {
             continue;
         }
+        let Some(argument_checks) = abi::argument_checks(&input_types) else {
+            continue;
+        };
         lower.body.clear();
         let mut inputs = Vec::new();
         let values = input_types
@@ -177,6 +181,10 @@ fn lower_to_ir(terms: &super::CodegenTermMap) -> Result<Modules, CodegenError> {
             ));
         };
         let symbol = symbol(name.as_str());
+        lower
+            .modules
+            .argument_checks
+            .insert(symbol.clone(), argument_checks);
         lower.modules.exports.push(GeneratedFunction {
             source_name: name.to_string(),
             symbol: symbol.clone(),

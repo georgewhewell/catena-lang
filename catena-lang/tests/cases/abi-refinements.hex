@@ -1,0 +1,47 @@
+# The product precedes its binders to exercise order-independent admission.
+(def program checked-matrix-size :
+  ([n m.] {({({[.n] [.m]} type.stdlib.numeric.*) u64} :) ({[.n] u64} :) ({[.m] u64} :)})
+  -> ([n m.] (u64 val))
+= ([elements rows columns.] [.elements] :.forget))
+
+(def program checked-index :
+  ([n.] {({[.n] u64} :) ([.n] stdlib.gpu.memory.type.Ix val)}) -> ([n.] ([.n] stdlib.gpu.memory.type.Ix val))
+= ([length index.] [.index]))
+
+(def program checked-repeated-size :
+  ([n.] {({[.n] u64} :) ({[.n] u64} :)}) -> ([n.] (u64 val))
+= ([first second.] [.second] :.forget))
+
+# Without a runtime extent this helper cannot be a safe foreign entry.
+(def program erased-index-bound :
+  ([n.] ([.n] stdlib.gpu.memory.type.Ix val)) -> ([n.] ([.n] stdlib.gpu.memory.type.Ix val))
+= [index])
+
+# Nor may an erased proof be supplied by omitting an ABI argument.
+(def program erased-proof :
+  ([p.] {(u64 val) ([.p] |-)}) -> ([p.] (u64 val))
+= ([value witness.] [.value]))
+
+(def program canonical-bool : (bool val) -> (bool val) = [value])
+
+(def program checked-zero : ({type.const.u64.0x0000000000000000 u64} :) -> (u64 val) = :.forget)
+
+(def program checked-volume :
+  ([n m k.] {({({[.n] ({[.m] [.k]} type.stdlib.numeric.*)} type.stdlib.numeric.*) u64} :) ({[.n] u64} :) ({[.m] u64} :) ({[.k] u64} :)})
+  -> ([n m k.] (u64 val))
+= ([volume depth rows columns.] [.volume] :.forget))
+
+# A named non-u64 scalar is a valid foreign input; its proof output is erased.
+(def program checked-named-bool :
+  ({[b] bool} :)
+  ->
+  {1 ({[b] bool.t} = |-)}
+= stdlib.assert.assert_true)
+
+# A constant-named input is a relation the foreign ABI cannot check.
+(def program constant-named-u32 : ({type.const.u32.0x00000000 u32} :) -> (u32 val) = :.forget)
+
+# So is a non-u64 name shared by two inputs.
+(def program repeated-named-bool :
+  ([b.] {({[.b] bool} :) ({[.b] bool} :)}) -> ([b.] (bool val))
+= ([first second.] [.second] :.forget))

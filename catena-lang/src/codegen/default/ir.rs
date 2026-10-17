@@ -67,6 +67,7 @@ pub(super) struct Modules {
     pub(super) functions: BTreeMap<String, Function>,
     pub(super) kernels: BTreeMap<String, Function>,
     pub(super) exports: Vec<GeneratedFunction>,
+    pub(super) argument_checks: BTreeMap<String, Vec<super::abi::ArgumentCheck>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

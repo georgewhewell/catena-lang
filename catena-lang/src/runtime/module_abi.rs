@@ -9,7 +9,11 @@
 //! The services are optional: a module without them still loads and runs
 //! without a generated-allocation limit.
 //!
-//! Entry points use the C ABI with inputs in `GeneratedFunction` order:
+//! A generator owns the safety of its entry points. It must not export an entry
+//! point whose inputs carry a relation that its code relies on but neither checks
+//! itself nor exposes through an argument check.
+//!
+//! Entry points and checks use the C ABI with inputs in `GeneratedFunction` order:
 //! `Bool` as `uint8_t` (0 or 1), `U16`/`U32`/`U64` as the unsigned integer of that
 //! width, `F32` as `float`, and `MemOwn`/`MemRef` as `struct { void *data;
 //! uint64_t len; }` by value. Entry points then take one pointer per output.
@@ -21,3 +25,12 @@ pub const ALLOCATION_BUDGET_BEGIN: &str = "catena_generated_allocation_budget_be
 
 /// `extern "C" void ()`: stop charging and lift the limit.
 pub const ALLOCATION_BUDGET_END: &str = "catena_generated_allocation_budget_end";
+
+/// Name of an entry point's optional argument check.
+///
+/// `extern "C" int64_t (inputs...)` takes the entry point's inputs and returns the
+/// index of the first argument that violates its refinement, or `-1`. The runtime
+/// calls it, when present, before transferring any input to the entry point.
+pub fn argument_check_symbol(entry_symbol: &str) -> String {
+    format!("catena_check_arguments__{entry_symbol}")
+}

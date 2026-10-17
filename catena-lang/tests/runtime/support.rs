@@ -6,28 +6,25 @@ use catena_lang::{
     compile::compile,
     report::CompileReport,
     runtime::{Artifact, GpuDialect, Runtime},
-    stdlib::BundleRegistry,
 };
 use metacat::theory::RawTheorySet;
 
 pub fn runtime_with_fixture(fixture: &str) -> anyhow::Result<(Runtime, Artifact)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dialect = configured_gpu_dialect()?;
-    let mut registry = BundleRegistry::new(&[])?;
-    let name = registry.add_directory(root.join("stdlib/default"))?;
-    let files = registry.resolve(&[&name])?;
     let path = root.join("tests/runtime/fixtures").join(fixture);
     let source = std::fs::read_to_string(&path)
         .with_context(|| format!("reading runtime fixture {}", path.display()))?;
-    let raw = RawTheorySet::from_texts(
-        files
-            .iter()
-            .map(|file| file.source.as_ref())
-            .chain([source.as_str()]),
-    )?;
+    runtime_with_source(&source)
+}
+
+pub fn runtime_with_source(source: &str) -> anyhow::Result<(Runtime, Artifact)> {
+    let dialect = configured_gpu_dialect()?;
+    let mut sources: Vec<&str> = catena_lang::stdlib::sources().collect();
+    sources.push(source);
+    let raw = RawTheorySet::from_texts(sources)?;
     let mut report = CompileReport::new(raw);
     let module = compile(&mut report, CodegenKind::Default, dialect)
-        .with_context(|| format!("compiling default runtime fixture {fixture}"))?;
+        .with_context(|| "compiling default runtime fixture")?;
     let runtime = Runtime::new(dialect)?;
     let artifact = runtime.load(module)?;
     Ok((runtime, artifact))

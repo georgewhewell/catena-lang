@@ -121,5 +121,34 @@ template<class T,class M> __host__ __device__ uint64_t catena_mem_count(M mem) {
 "#,
         guard = dialect.device_compile_guard()
     ));
+    result.push_str(
+        r#"
+// A dependent size of a foreign call. Overflow invalidates it unless a factor is zero.
+typedef struct {
+    uint64_t value;
+    uint8_t valid;
+} catena_extent;
+
+__host__ static inline catena_extent catena_extent_mul(catena_extent a, catena_extent b) {
+    if ((a.valid && a.value == 0) || (b.valid && b.value == 0)) {
+        return catena_extent{0, 1};
+    }
+    uint64_t product = 0;
+    if (!a.valid || !b.valid || __builtin_mul_overflow(a.value, b.value, &product)) {
+        return catena_extent{0, 0};
+    }
+    return catena_extent{product, 1};
+}
+
+__host__ static inline uint8_t catena_extent_equals(uint64_t argument, catena_extent extent) {
+    return extent.valid && argument == extent.value;
+}
+
+__host__ static inline uint8_t catena_extent_bounds(uint64_t index, catena_extent extent) {
+    return extent.valid && index < extent.value;
+}
+
+"#,
+    );
     result
 }
