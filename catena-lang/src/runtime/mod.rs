@@ -81,6 +81,9 @@ mod executor;
 /// Runtime-call signature metadata.
 mod signature;
 
+/// Symbols generated modules export for the runtime.
+pub mod module_abi;
+
 //#[cfg(test)]
 //mod tests;
 

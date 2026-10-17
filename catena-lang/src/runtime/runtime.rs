@@ -107,6 +107,14 @@ pub enum ExecError {
     },
     #[error("Argument {index} contains device memory from a different GPU backend")]
     IncompatibleDeviceMemory { index: usize },
+    #[error("artifact does not provide generated-device-allocation controls")]
+    AllocationBudgetUnavailable,
+    #[error(
+        "an artifact cannot be called again while one of its calls is in progress on this thread"
+    )]
+    ReentrantCall,
+    #[error("GPU execution failed while synchronizing: {0}")]
+    GpuSynchronization(String),
 }
 
 impl Runtime {
@@ -162,10 +170,11 @@ impl Runtime {
         source: &str,
         signature_table: SignatureTable,
     ) -> Result<Artifact, InitError> {
-        let dialect = self.gpu.dialect();
         if let Some((name, index)) = ref_output(&signature_table) {
             return Err(InitError::UnsupportedRefOutput { name, index });
         }
+
+        let dialect = self.gpu.dialect();
 
         let report_dir = tempfile::Builder::new()
             .prefix("catena-report-")
@@ -284,7 +293,12 @@ impl Artifact {
             .map(|values| values.try_into().expect("output arity already validated"))
     }
 
-    /// Run a source-level `program` with dynamically sized inputs and outputs.
+    /// Run a source-level `program` with dynamically sized
+    /// input and output collections.
+    ///
+    /// This is the public execution boundary for adapters such as SafeRuntime,
+    /// whose arities are known from a runtime protocol rather than const
+    /// generics.
     pub fn exec_values<'a>(
         &self,
         name: &str,
@@ -297,12 +311,59 @@ impl Artifact {
         self.exec_symbol(name, signature, args)
     }
 
+    /// Run a source-level program while conservatively bounding every device
+    /// allocation made by generated code during this invocation. Allocations
+    /// are charged cumulatively; generated frees do not refund the limit.
+    /// Caller-created input memory is not charged by this lower-level boundary.
+    /// A native budget or allocation-size violation traps the executing process,
+    /// like a failed Catena assertion; containment requires a worker process.
+    pub fn exec_values_with_generated_allocation_budget<'a>(
+        &self,
+        name: &str,
+        args: Vec<Value<'a>>,
+        byte_limit: u64,
+    ) -> Result<Vec<Value<'static>>, ExecError> {
+        let signature = self
+            .signatures
+            .get(name)
+            .ok_or_else(|| ExecError::UnknownSourceFunction(name.to_string()))?;
+        self.exec_symbol_with_generated_allocation_budget(name, signature, args, Some(byte_limit))
+    }
+
     fn exec_symbol<'a>(
         &self,
         name: &str,
         signature: &FunctionSignature,
         args: Vec<Value<'a>>,
     ) -> Result<Vec<Value<'static>>, ExecError> {
+        self.exec_symbol_with_generated_allocation_budget(name, signature, args, None)
+    }
+
+    fn exec_symbol_with_generated_allocation_budget<'a>(
+        &self,
+        name: &str,
+        signature: &FunctionSignature,
+        args: Vec<Value<'a>>,
+        allocation_budget: Option<u64>,
+    ) -> Result<Vec<Value<'static>>, ExecError> {
+        let _active = self.executor.enter().ok_or(ExecError::ReentrantCall)?;
+        self.exec_entered(name, signature, args, allocation_budget)
+    }
+
+    /// Execute while this thread holds the artifact's call guard.
+    fn exec_entered<'a>(
+        &self,
+        name: &str,
+        signature: &FunctionSignature,
+        args: Vec<Value<'a>>,
+        allocation_budget: Option<u64>,
+    ) -> Result<Vec<Value<'static>>, ExecError> {
+        // Reject unsupported limits while the caller's owned inputs are still
+        // Rust values, before transferring them across the generated-code ABI.
+        let supports_budget = self.executor.supports_allocation_budget();
+        if allocation_budget.is_some() && !supports_budget {
+            return Err(ExecError::AllocationBudgetUnavailable);
+        }
         // Check input arity lines up with what's in the function signature.
         if signature.inputs.len() != args.len() {
             return Err(ExecError::InputArityMismatch {
@@ -311,13 +372,6 @@ impl Artifact {
                 actual: args.len(),
             });
         }
-        let mut raw_outputs = signature
-            .outputs
-            .iter()
-            .copied()
-            .map(AbiValue::zeroed)
-            .collect::<Vec<_>>();
-
         for (index, (value, expected)) in args
             .iter()
             .zip(signature.inputs.iter().copied())
@@ -342,6 +396,14 @@ impl Artifact {
             }
         }
 
+        let executor = &self.executor;
+
+        let mut raw_outputs = signature
+            .outputs
+            .iter()
+            .copied()
+            .map(AbiValue::zeroed)
+            .collect::<Vec<_>>();
         let raw_inputs = args
             .into_iter()
             .map(|value| match value {
@@ -355,13 +417,27 @@ impl Artifact {
             })
             .collect::<Vec<_>>();
 
-        self.executor
-            .call(&signature.symbol, &raw_inputs, &mut raw_outputs);
+        match allocation_budget {
+            Some(byte_limit) => executor.call_with_generated_allocation_budget(
+                &signature.symbol,
+                &raw_inputs,
+                &mut raw_outputs,
+                byte_limit,
+            ),
+            None => executor.call(&signature.symbol, &raw_inputs, &mut raw_outputs),
+        }
 
-        raw_outputs
+        // Re-establish Rust ownership before the synchronization boundary. If
+        // synchronization reports a device fault, dropping `outputs` still
+        // attempts to release every allocation returned by generated code.
+        let outputs = raw_outputs
             .into_iter()
             .map(|output| self.resolve_output(output))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        self.gpu
+            .synchronize()
+            .map_err(|error| ExecError::GpuSynchronization(error.to_string()))?;
+        Ok(outputs)
     }
 
     fn resolve_output(&self, output: AbiValue) -> Result<Value<'static>, ExecError> {

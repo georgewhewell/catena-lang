@@ -5,6 +5,7 @@ pub(super) fn render(dialect: GpuDialect) -> String {
         "#include <{}>\n#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <math.h>\n",
         dialect.runtime_header()
     );
+    result.push_str(&crate::codegen::runtime_services::render(dialect));
     result.push_str(&format!(
         r#"
 __host__ __device__ inline void catena_assert(bool condition) {{
@@ -106,17 +107,19 @@ template<class T,size_t N> __device__ catena_shared_view<T> catena_slot(unsigned
     result.push_str(&format!(
         r#"
 inline catena_mem_own_t catena_allocate(uint64_t bytes) {{
-    catena_assert(bytes <= SIZE_MAX);
-    void* data = nullptr;
-    if (bytes) catena_gpu_check({}(&data,size_t(bytes)));
-    return {{data,bytes}};
+#if defined({guard})
+    catena_assert(false);
+    return {{nullptr,0}};
+#else
+    return {{catena_runtime_allocate(bytes,1),bytes}};
+#endif
 }}
 template<class T,class M> __host__ __device__ uint64_t catena_mem_count(M mem) {{
     catena_assert(mem.len % sizeof(T) == 0);
     return mem.len / sizeof(T);
 }}
 "#,
-        dialect.device_alloc_fn()
+        guard = dialect.device_compile_guard()
     ));
     result
 }

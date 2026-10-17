@@ -5,6 +5,7 @@
 
 pub(crate) mod default;
 mod dialect;
+mod runtime_services;
 
 use hexpr::Operation;
 use thiserror::Error;

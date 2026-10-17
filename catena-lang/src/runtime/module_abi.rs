@@ -1,0 +1,23 @@
+//! Symbols a generated module exports for the runtime besides its entry points.
+//!
+//! Every code generator that produces a [`crate::runtime::RuntimeModule`] implements this
+//! contract, so execution does not depend on which generator built a module. The
+//! runtime resolves these symbols by name when it loads the module. All state
+//! they control is per host thread and scoped to one entry-point invocation; the
+//! runtime does not re-enter a module while one of its calls is in progress.
+//!
+//! The services are optional: a module without them still loads and runs
+//! without a generated-allocation limit.
+//!
+//! Entry points use the C ABI with inputs in `GeneratedFunction` order:
+//! `Bool` as `uint8_t` (0 or 1), `U16`/`U32`/`U64` as the unsigned integer of that
+//! width, `F32` as `float`, and `MemOwn`/`MemRef` as `struct { void *data;
+//! uint64_t len; }` by value. Entry points then take one pointer per output.
+
+/// `extern "C" void (uint64_t byte_limit)`: start charging device allocations
+/// made by generated code against `byte_limit`. Charges are cumulative: freeing
+/// a buffer does not refund it. Exceeding the limit traps the process.
+pub const ALLOCATION_BUDGET_BEGIN: &str = "catena_generated_allocation_budget_begin";
+
+/// `extern "C" void ()`: stop charging and lift the limit.
+pub const ALLOCATION_BUDGET_END: &str = "catena_generated_allocation_budget_end";
