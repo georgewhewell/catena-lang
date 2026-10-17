@@ -19,7 +19,7 @@ pub use crate::runtime::GpuDialect;
 
 type CodegenTermMap = TheoryTermMap<OperationWithBoundarySizes<Operation>>;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CodegenKind {
     #[default]
     Default,

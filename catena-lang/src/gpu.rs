@@ -1,9 +1,11 @@
 mod native;
+pub(crate) mod vmm;
 
 use crate::runtime::{Backend, GpuDialect, MemError};
 use native::NativeApi;
 pub(crate) use native::{IPC_HANDLE_BYTES, RawIpcMemHandle};
-use std::{ffi::c_void, sync::Arc};
+use std::{ffi::c_void, fs::File, os::fd::OwnedFd, sync::Arc};
+use vmm::SharedAllocation;
 
 /// Process-local device operations. Code generation remains backend-specific.
 #[derive(Debug)]
@@ -121,6 +123,63 @@ impl GpuApi {
     pub(crate) fn ipc_close_mem_handle(&self, data: *mut c_void) -> Result<(), MemError> {
         match self {
             Self::Native(gpu) => gpu.ipc_close_mem_handle(data),
+        }
+    }
+    pub(crate) fn own_shared(
+        &self,
+        file: &File,
+        byte_len: usize,
+    ) -> Result<SharedAllocation, MemError> {
+        match self {
+            Self::Native(gpu) => {
+                // The asset owner has checked the descriptor and exact length.
+                let bytes = unsafe { memmap2::MmapOptions::new().len(byte_len).map(file) }
+                    .map_err(MemError::SharedHandleIo)?;
+                gpu.own_shared(&bytes)
+            }
+        }
+    }
+    /// Upload only the requested range of an immutable asset file.
+    pub(crate) fn own_shared_range(
+        &self,
+        file: &File,
+        file_len: u64,
+        offset: u64,
+        byte_len: usize,
+    ) -> Result<SharedAllocation, MemError> {
+        if offset == 0 && byte_len as u64 == file_len {
+            return self.own_shared(file, byte_len);
+        }
+        // The asset owner has checked the descriptor, length and range.
+        match self {
+            Self::Native(gpu) => {
+                let bytes = unsafe {
+                    memmap2::MmapOptions::new()
+                        .offset(offset)
+                        .len(byte_len)
+                        .map(file)
+                }
+                .map_err(MemError::SharedHandleIo)?;
+                gpu.own_shared(&bytes)
+            }
+        }
+    }
+    pub(crate) fn import_shared(
+        &self,
+        fd: OwnedFd,
+        byte_len: usize,
+        allocation_len: usize,
+        file_offset: u64,
+    ) -> Result<SharedAllocation, MemError> {
+        match self {
+            Self::Native(gpu) => {
+                if file_offset != 0 {
+                    return Err(MemError::InvalidSharedAllocation {
+                        reason: "native GPU allocation has a file offset",
+                    });
+                }
+                gpu.import_shared(fd, byte_len, allocation_len)
+            }
         }
     }
 }

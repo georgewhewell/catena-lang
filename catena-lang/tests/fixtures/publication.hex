@@ -1,0 +1,22 @@
+(def program publish-pair : {((cap.own mem) val) ((cap.own mem) val)} -> {((cap.own mem) val) ((cap.own mem) val)}
+= ([a b.]
+  ({[.a] const.u64.0x0000000000000000 const.u64.0x0000000000000008} mem.publish [a-first.])
+  ({[.b] const.u64.0x0000000000000001 const.u64.0x0000000000000005} mem.publish [b-first.])
+  ({[.a-first] const.u64.0x0000000000000000 const.u64.0x0000000000000010} mem.publish [a-last.])
+  ({[.b-first] const.u64.0x0000000000000001 const.u64.0x0000000000000008} mem.publish [b-last.])
+  [.a-last b-last]))
+
+(def program publish-prefix : {((cap.own mem) val) (u64 val) (u64 val)} -> ((cap.own mem) val)
+= mem.publish)
+
+(def program publish-regression : ((cap.own mem) val) -> ((cap.own mem) val)
+= ([buffer.]
+  ({[.buffer] const.u64.0x0000000000000000 const.u64.0x0000000000000008} mem.publish [first.])
+  ({[.first] const.u64.0x0000000000000000 const.u64.0x0000000000000004} mem.publish)))
+
+# Returning different bytes after publication must fail final-prefix verification.
+(def program publish-changed : ((cap.own mem) val) -> ((cap.own mem) val)
+= ([buffer.]
+  ({[.buffer] const.u64.0x0000000000000000 const.u64.0x0000000000000008} mem.publish [first.])
+  ([.first] compute-free)
+  ({const.u64.0x0000000000000001 const.u64.0x0000000000000009} compute-fill)))

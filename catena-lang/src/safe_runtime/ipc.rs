@@ -1,9 +1,9 @@
 //! Process-local CUDA/HIP IPC primitives.
 //!
-//! This module deliberately does not define a transport protocol. Device
-//! addresses are used only while deriving a view offset and are never part of
+//! Wire-view conversion carries opaque handles and bounds. Device addresses are used only while deriving a view offset and are never part of
 //! the exported representation.
 
+use super::protocol::WireIpcBuffer;
 use std::{ffi::c_void, sync::Arc};
 
 use crate::{
@@ -188,6 +188,48 @@ impl Drop for ImportedIpcAllocation {
         let data = std::mem::replace(&mut self.data, std::ptr::null_mut());
         let _ = self.gpu.ipc_close_mem_handle(data);
     }
+}
+
+pub(super) fn encode_ipc_buffer(exported: ExportedIpcView) -> WireIpcBuffer {
+    WireIpcBuffer {
+        handle: exported.handle().map(|handle| handle.as_bytes().to_vec()),
+        allocation_byte_len: exported.allocation_byte_len(),
+    }
+}
+
+pub(super) fn intern_buffer(buffers: &mut Vec<WireIpcBuffer>, buffer: WireIpcBuffer) -> usize {
+    buffers
+        .iter()
+        .position(|existing| existing == &buffer)
+        .unwrap_or_else(|| {
+            buffers.push(buffer);
+            buffers.len() - 1
+        })
+}
+
+pub(super) fn import_ipc_buffers(
+    ipc: &IpcTransport,
+    buffers: Vec<WireIpcBuffer>,
+) -> Result<Vec<ImportedIpcAllocation>, String> {
+    buffers
+        .into_iter()
+        .map(|buffer| {
+            if buffer.handle.is_none() && buffer.allocation_byte_len != 0 {
+                return Err("non-empty IPC allocation has no handle".to_string());
+            }
+            let handle =
+                buffer
+                    .handle
+                    .map(|bytes| {
+                        bytes.try_into().map(IpcMemoryHandle::from_bytes).map_err(
+                            |bytes: Vec<u8>| format!("IPC memory handle has {} bytes", bytes.len()),
+                        )
+                    })
+                    .transpose()?;
+            ipc.import_allocation(handle, buffer.allocation_byte_len)
+                .map_err(|error| error.to_string())
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -2,56 +2,296 @@
 //!
 //! Generated GPU code runs through native libraries, so a failed Catena assertion,
 //! GPU runtime failure, or native crash can terminate the process rather than return
-//! a Rust error. [`SafeRuntime`] solves this by executing [`Runtime`] in a child
+//! a Rust error. [`SafeRuntime`] solves this by executing [`crate::runtime::Runtime`] in a child
 //! process and communicating over a framed protocol. If execution terminates the
 //! child, the host process survives and receives a structured error with its exit
 //! status and stderr.
+//!
+//! ## Embedding hosts
+//!
+//! [`Session`] compiles programs in one long-lived execution worker. Programs
+//! keep that worker alive after the session handle is dropped.
+//! A loaded program exposes its immutable entry-point metadata so a host can
+//! reject an incompatible dynamic ABI before execution.
+//!
+//! [`compute`] executes arbitrary entry points with bounded host inputs
+//! and outputs; all device allocations and invocation state remain in the
+//! worker. An [`AssetOwner`] can retain immutable allocations across execution
+//! sessions. Session construction loads the native GPU runtime only in workers,
+//! not in the host process. [`SafeRuntime`]'s value API remains available for
+//! callers that exchange device memory with the worker over GPU IPC.
+//!
+//! ```no_run
+//! use catena_lang::{
+//!     codegen::CodegenKind,
+//!     runtime::Backend,
+//!     safe_runtime::{
+//!         Session, run_safe_runtime_child_if_requested,
+//!         compute::{Input, Output, Request},
+//!     },
+//!     stdlib,
+//! };
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Worker mode must be handled before starting threads or using stdout.
+//!     if run_safe_runtime_child_if_requested()? { return Ok(()); }
+//!     let mut session = Session::new(Backend::Auto)?;
+//!     let mut sources: Vec<&str> = stdlib::sources().collect();
+//!     sources.push("(def program increment : (u64 val) -> (u64 val) = ({smolcat.value.named (const.u64.0x0000000000000001 smolcat.value.named) stdlib.numeric.numeric.u64} stdlib.numeric.+ :.forget))");
+//!     let program = session.prepare(sources, CodegenKind::Default)?;
+//!     let output = session.compute(&program, Request {
+//!         entry_point: "increment", inputs: &[Input::U64(41)],
+//!         max_output_bytes: 8, allocation_budget: 0,
+//!     })?;
+//!     assert_eq!(output, [Output::U64(42)]);
+//!     Ok(())
+//! }
+//! ```
 
-use std::{
-    env,
-    io::{self, BufReader, Read},
-    path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
-    sync::{Arc, Mutex},
-    thread::{self, JoinHandle},
-};
-
+use self::ipc::IpcTransport;
+use self::operation::SessionOperationGate;
+use self::worker::WorkerProcess;
+use crate::runtime::Backend;
+use crate::runtime::EntryPoint;
+use crate::runtime::ExecError;
+use crate::runtime::MemError;
+use crate::runtime::RuntimeId;
+use std::io;
+use std::os::fd::RawFd;
+use std::path::PathBuf;
+use std::process::ExitStatus;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
 use thiserror::Error;
 
+mod assets;
+pub mod compute;
+mod embedding;
+pub use embedding::{Asset, AssetOwner, AssetSlice, AssetUsage, Program, Session};
+#[cfg(target_os = "macos")]
+mod darwin_fds;
+mod fd_transport;
+mod gpu_error;
 mod ipc;
 mod protocol;
-
-use self::{
-    ipc::{ImportedIpcAllocation, IpcMemoryHandle, IpcTransport},
-    protocol::{
-        ProtocolError, RemoteExecError, Request, Response, WireExecution, WireIpcBuffer, WireValue,
-        read_frame, write_frame,
-    },
-};
-use crate::runtime::{
-    Artifact as RuntimeArtifact, ExecError, GpuDialect, MemError, MemOwn, Runtime, RuntimeModule,
-    Value,
+pub use assets::{MAX_RESIDENT_ASSET_BYTES, MAX_RESIDENT_ASSETS};
+pub use protocol::ComputeOutput;
+pub(crate) use protocol::{
+    ComputeInput, WireAssetSlice as ComputeAssetSlice, WireCompute as ComputeRequest,
 };
 
 const CHILD_MODE_ENV: &str = "CATENA_SAFE_RUNTIME_CHILD";
+const CHILD_ASSET_SOCKET_FD: RawFd = 3;
+
+/// Default wall-clock limit for one isolated source-load and GPU compilation.
+pub const DEFAULT_COMPILE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Default wall-clock limit for one isolated GPU operation or complete invocation.
+pub const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+const DROP_GRACE_TIMEOUT: Duration = Duration::from_millis(250);
+const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const STDERR_TAIL_BYTES: usize = 64 * 1024;
+
+/// Deadlines applied by a process-isolated runtime.
+///
+/// The compile deadline covers each complete source or module load request. The execution
+/// deadline covers initialization, asset and artifact control requests, generic
+/// execution, and one complete compute invocation including publications.
+/// Operations first wait to acquire the session lease; that queue wait happens
+/// before the corresponding deadline is armed. A compute invocation retains
+/// the lease and its watchdog until completion, including synchronous callbacks. Callback code cannot be preempted or
+/// bounded by the watchdog and must not re-enter the same session; re-entry is
+/// rejected instead of waiting on itself. If a callback never returns after
+/// the watchdog kills its worker, the parent cannot reap that worker and
+/// process-wide worker admission cannot reopen unless the callback returns and
+/// teardown subsequently proves leader exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SafeRuntimeTimeouts {
+    compile: Duration,
+    execution: Duration,
+}
+
+impl SafeRuntimeTimeouts {
+    /// Start from the production defaults.
+    pub const fn new() -> Self {
+        Self {
+            compile: DEFAULT_COMPILE_TIMEOUT,
+            execution: DEFAULT_EXECUTION_TIMEOUT,
+        }
+    }
+
+    /// Set the deadline for one complete source-load and GPU-compile request.
+    pub const fn with_compile_timeout(mut self, timeout: Duration) -> Self {
+        self.compile = timeout;
+        self
+    }
+
+    /// Set the deadline for one control/execution operation or complete invocation.
+    pub const fn with_execution_timeout(mut self, timeout: Duration) -> Self {
+        self.execution = timeout;
+        self
+    }
+
+    /// Return the deadline for one source-load and compilation request.
+    #[must_use]
+    pub const fn compile_timeout(self) -> Duration {
+        self.compile
+    }
+
+    /// Return the deadline for one non-compilation operation or complete invocation.
+    #[must_use]
+    pub const fn execution_timeout(self) -> Duration {
+        self.execution
+    }
+}
+
+impl Default for SafeRuntimeTimeouts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Failures while attaching or slicing a session-resident asset.
+#[derive(Debug, Error)]
+pub enum AssetError {
+    #[error("failed to inspect verified asset descriptor: {0}")]
+    FileMetadata(#[source] io::Error),
+    #[error("asset length must be between 1 and {maximum} bytes, got {actual}")]
+    InvalidLength { actual: u64, maximum: u64 },
+    #[error("asset transport failed: {0}")]
+    Transport(String),
+    #[error("invalid local asset request: {0}")]
+    InvalidRequest(String),
+    #[error("SafeRuntime asset attachment exceeded {timeout:?}")]
+    TimedOut { timeout: Duration },
+    #[error("SafeRuntime child rejected asset: {0}")]
+    Remote(String),
+    #[error("SafeRuntime child returned an unexpected asset response")]
+    UnexpectedResponse,
+    #[error("SafeRuntime child terminated while attaching an asset with {status}: {stderr}")]
+    ChildTerminated { status: ExitStatus, stderr: String },
+    #[error("SafeRuntime is unavailable because its child terminated with {status}: {stderr}")]
+    Unavailable { status: ExitStatus, stderr: String },
+    #[error("asset belongs to a different GPU asset owner")]
+    WrongSession,
+    #[error(
+        "asset slice at offset {offset} with {byte_len} bytes exceeds its {asset_byte_len}-byte asset"
+    )]
+    InvalidSlice {
+        offset: u64,
+        byte_len: u64,
+        asset_byte_len: u64,
+    },
+}
+
+impl AssetError {
+    /// Whether the worker protocol can no longer be trusted after this error.
+    ///
+    /// Caller-side validation, local request preparation, and a structured
+    /// rejection from the worker leave the session usable. Transport failures,
+    /// termination, and an unexpected response do not: the next operation must
+    /// use a new session.
+    pub fn invalidates_session(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport(_)
+                | Self::TimedOut { .. }
+                | Self::UnexpectedResponse
+                | Self::ChildTerminated { .. }
+                | Self::Unavailable { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AttachedAsset {
+    pub(crate) id: u64,
+    pub(crate) byte_len: u64,
+}
+
+/// Failures from worker-resident computation and artifact control.
+#[derive(Debug, Error)]
+pub enum ResidentError {
+    #[error("resident GPU request failed: {0}")]
+    Remote(String),
+    #[error("invalid local resident GPU request: {0}")]
+    InvalidRequest(String),
+    #[error("resident GPU teardown failed: {0}")]
+    Teardown(String),
+    #[error("SafeRuntime child returned an unexpected resident response")]
+    UnexpectedResponse,
+    #[error("compute publication was cancelled")]
+    Cancelled,
+    #[error("compute publication callback panicked")]
+    CallbackPanicked,
+    #[error("resident GPU transport failed: {0}")]
+    Transport(String),
+    #[error("resident GPU operation exceeded {timeout:?}")]
+    TimedOut { timeout: Duration },
+    #[error("SafeRuntime child terminated during a resident GPU request with {status}: {stderr}")]
+    ChildTerminated { status: ExitStatus, stderr: String },
+    #[error("SafeRuntime is unavailable because its child terminated with {status}: {stderr}")]
+    Unavailable { status: ExitStatus, stderr: String },
+}
+
+impl ResidentError {
+    /// Whether the worker protocol can no longer be trusted after this error.
+    pub fn invalidates_session(&self) -> bool {
+        !matches!(self, Self::Remote(_) | Self::InvalidRequest(_))
+    }
+}
 
 /// Initialization failures for [`SafeRuntime`].
 #[derive(Debug, Error)]
 pub enum SafeInitError {
     #[error("failed to identify the current executable: {0}")]
     CurrentExecutable(#[source] io::Error),
+    #[error("SafeRuntime worker executable must be an absolute path")]
+    InvalidExecutable,
     #[error("failed to spawn SafeRuntime child {executable}: {source}")]
     Spawn {
         executable: PathBuf,
         #[source]
         source: io::Error,
     },
+    #[error("failed to create SafeRuntime worker scratch directory under {parent}: {source}")]
+    Scratch {
+        parent: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to create SafeRuntime asset transport: {0}")]
+    AssetTransport(#[source] io::Error),
     #[error("SafeRuntime setup transport failed: {0}")]
     Transport(String),
+    #[error("invalid local SafeRuntime setup request: {0}")]
+    InvalidRequest(String),
+    #[error("failed to inspect the host SIGCHLD disposition: {0}")]
+    ChildSignal(#[source] io::Error),
+    #[error(
+        "SafeRuntime requires waitable child processes; SIGCHLD must not use SIG_IGN or SA_NOCLDWAIT"
+    )]
+    UnwaitableChildren,
+    #[error("failed to start a SafeRuntime lifecycle support thread: {0}")]
+    LifecycleThread(#[source] io::Error),
+    #[error("cannot start SafeRuntime while {workers} previous worker leader(s) remain unreaped")]
+    PreviousWorkerUnreaped { workers: u16 },
+    #[error("SafeRuntime process lifecycle tracker exhausted its concurrent-spawn capacity")]
+    LifecycleCapacity,
     #[error("SafeRuntime child initialization failed: {0}")]
     RemoteInitialization(String),
     #[error("SafeRuntime child failed to load module: {0}")]
     RemoteLoad(String),
+    #[error("SafeRuntime source loading and GPU compilation exceeded {timeout:?}")]
+    CompileTimedOut { timeout: Duration },
+    #[error("SafeRuntime initialization exceeded {timeout:?}")]
+    InitializationTimedOut { timeout: Duration },
+    #[error("SafeRuntime compile timeout must be greater than zero")]
+    InvalidCompileTimeout,
+    #[error("SafeRuntime execution timeout must be greater than zero")]
+    InvalidExecutionTimeout,
     #[error("SafeRuntime child returned an unexpected setup response")]
     UnexpectedResponse,
     #[error(
@@ -62,15 +302,35 @@ pub enum SafeInitError {
     Memory(#[from] MemError),
 }
 
-/// Execution failures reported by a process-isolated [`Artifact`].
+impl SafeInitError {
+    /// Whether an existing worker protocol can no longer be trusted after this
+    /// error.
+    ///
+    /// Of these variants, only local request preparation and a structured
+    /// load rejection can occur without invalidating a live
+    /// session. The construction-only variants are conservatively classified
+    /// as invalidating so callers never retain a session whose health is
+    /// uncertain.
+    pub fn invalidates_session(&self) -> bool {
+        !matches!(self, Self::RemoteLoad(_) | Self::InvalidRequest(_))
+    }
+}
+
+/// Execution failures reported by [`SafeRuntime`].
 #[derive(Debug, Error)]
 pub enum SafeExecError {
-    #[error(transparent)]
-    Runtime(#[from] ExecError),
     #[error("SafeRuntime artifact is no longer loaded in its child")]
     UnknownArtifact,
+    #[error(transparent)]
+    Runtime(#[from] ExecError),
     #[error("SafeRuntime transport failed: {0}")]
     Transport(String),
+    #[error("invalid local SafeRuntime execution request: {0}")]
+    InvalidRequest(String),
+    #[error("SafeRuntime child rejected memory IPC: {0}")]
+    RemoteMemory(String),
+    #[error("SafeRuntime execution exceeded {timeout:?}")]
+    TimedOut { timeout: Duration },
     #[error("SafeRuntime child returned an unexpected execution response")]
     UnexpectedResponse,
     #[error("SafeRuntime child terminated with {status}: {stderr}")]
@@ -79,6 +339,25 @@ pub enum SafeExecError {
     Unavailable { status: ExitStatus, stderr: String },
     #[error(transparent)]
     Memory(#[from] MemError),
+}
+
+impl SafeExecError {
+    /// Whether the worker protocol can no longer be trusted after this error.
+    ///
+    /// Local validation/allocation errors and structured runtime or child IPC
+    /// rejections leave request/response synchronization intact. Transport
+    /// failures, deadlines, termination, and semantically impossible responses
+    /// require a new session.
+    pub fn invalidates_session(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport(_)
+                | Self::TimedOut { .. }
+                | Self::UnexpectedResponse
+                | Self::ChildTerminated { .. }
+                | Self::Unavailable { .. }
+        )
+    }
 }
 
 /// Failure in the worker-mode entrypoint itself.
@@ -90,626 +369,93 @@ pub enum ChildMainError {
     ExpectedInitialization,
     #[error("SafeRuntime child received a second Initialize request")]
     AlreadyInitialized,
+    #[error("SafeRuntime child GPU synchronization failed: {0}")]
+    GpuSynchronization(String),
 }
 
-/// A process-isolated GPU context for loading and executing artifacts.
+/// A process-isolated Catena runtime.
 ///
 /// The host executable must call [`run_safe_runtime_child_if_requested`] before
 /// parsing arguments or writing to stdout. `SafeRuntime` respawns that same
 /// executable and reserves its stdin/stdout for the worker protocol.
-#[derive(Debug)]
-pub struct SafeRuntime {
-    session: Arc<SafeSession>,
-}
-
-/// A compiled Catena program executable in the child process.
 ///
-/// It keeps the child alive after its [`SafeRuntime`] is dropped. Dropping it
-/// releases child-side artifact state; native code remains mapped until exit.
-#[derive(Debug)]
-pub struct Artifact {
-    session: Arc<SafeSession>,
-    remote_id: usize,
-}
-
-#[derive(Debug)]
-struct SafeSession {
-    worker: Mutex<WorkerProcess>,
-    ipc: IpcTransport,
-}
-
-impl SafeRuntime {
-    /// Create a process-isolated context for the selected GPU dialect.
-    pub fn new(dialect: GpuDialect) -> Result<Self, SafeInitError> {
-        let executable = env::current_exe().map_err(SafeInitError::CurrentExecutable)?;
-        let ipc = IpcTransport::load(dialect.into())?;
-        let mut worker = WorkerProcess::spawn(&executable)?;
-        worker
-            .send(&Request::Initialize { dialect })
-            .map_err(map_init_worker_error)?;
-
-        match worker.receive().map_err(map_init_worker_error)? {
-            Response::Initialized(Ok(())) => Ok(Self {
-                session: Arc::new(SafeSession {
-                    worker: Mutex::new(worker),
-                    ipc,
-                }),
-            }),
-            Response::Initialized(Err(error)) => Err(SafeInitError::RemoteInitialization(error)),
-            Response::Loaded(_) | Response::Executed(_) => Err(SafeInitError::UnexpectedResponse),
-        }
-    }
-
-    /// Load a rendered runtime module into an isolated child process.
-    pub fn load(&mut self, module: RuntimeModule) -> Result<Artifact, SafeInitError> {
-        let mut worker = self
-            .session
-            .worker
-            .lock()
-            .map_err(|_| SafeInitError::Transport("worker lock was poisoned".to_string()))?;
-        worker
-            .send(&Request::LoadModule { module })
-            .map_err(map_init_worker_error)?;
-
-        match worker.receive().map_err(map_init_worker_error)? {
-            Response::Loaded(Ok(remote_id)) => Ok(Artifact {
-                session: self.session.clone(),
-                remote_id,
-            }),
-            Response::Loaded(Err(error)) => Err(SafeInitError::RemoteLoad(error)),
-            Response::Initialized(_) | Response::Executed(_) => {
-                Err(SafeInitError::UnexpectedResponse)
-            }
-        }
-    }
-}
-
-impl Artifact {
-    /// Run a source-level program in the child process.
-    pub fn exec<'a, const M: usize, const N: usize>(
-        &self,
-        name: &str,
-        args: [Value<'a>; M],
-    ) -> Result<[Value<'static>; N], SafeExecError> {
-        self.exec_values(name, args.into())?
-            .try_into()
-            .map_err(|_| SafeExecError::UnexpectedResponse)
-    }
-
-    /// Run a source-level program with dynamically sized inputs and outputs.
-    pub fn exec_values<'a>(
-        &self,
-        name: &str,
-        args: Vec<Value<'a>>,
-    ) -> Result<Vec<Value<'static>>, SafeExecError> {
-        let (buffers, wire_args) = self.encode_parent_arguments(&args)?;
-        let mut worker = self
-            .session
-            .worker
-            .lock()
-            .map_err(|_| SafeExecError::Transport("worker lock was poisoned".to_string()))?;
-        if let Some(termination) = worker.termination() {
-            return Err(SafeExecError::Unavailable {
-                status: termination.status,
-                stderr: termination.stderr.clone(),
-            });
-        }
-
-        worker
-            .send(&Request::Execute {
-                artifact: self.remote_id,
-                name: name.to_string(),
-                buffers,
-                args: wire_args,
-            })
-            .map_err(map_exec_worker_error)?;
-
-        let response = worker.receive().map_err(map_exec_worker_error)?;
-        let execution = match response {
-            Response::Executed(Ok(execution)) => execution,
-            Response::Executed(Err(RemoteExecError::Runtime(error))) => {
-                return Err(SafeExecError::Runtime(error));
-            }
-            Response::Executed(Err(RemoteExecError::UnknownArtifact)) => {
-                return Err(SafeExecError::UnknownArtifact);
-            }
-            Response::Executed(Err(RemoteExecError::Memory(error))) => {
-                return Err(SafeExecError::Transport(format!(
-                    "child memory IPC failed: {error}"
-                )));
-            }
-            Response::Initialized(_) | Response::Loaded(_) => {
-                return Err(SafeExecError::UnexpectedResponse);
-            }
-        };
-        let values = self.decode_child_outputs(execution);
-        worker
-            .send(&Request::ReleaseOutputs)
-            .map_err(map_exec_worker_error)?;
-        values
-    }
-
-    /// Exports parent-owned arguments as views for the child to copy into its own allocations.
-    fn encode_parent_arguments(
-        &self,
-        args: &[Value<'_>],
-    ) -> Result<(Vec<WireIpcBuffer>, Vec<WireValue>), SafeExecError> {
-        let mut buffers = Vec::new();
-        let mut values = Vec::with_capacity(args.len());
-        for (index, value) in args.iter().enumerate() {
-            let wire = match value {
-                Value::Bool(value) => WireValue::Bool(*value),
-                Value::U16(value) => WireValue::U16(*value),
-                Value::U32(value) => WireValue::U32(*value),
-                Value::U64(value) => WireValue::U64(*value),
-                Value::F32(value) => WireValue::F32(*value),
-                Value::MemOwn(memory) => {
-                    if memory.backend() != self.session.ipc.backend() {
-                        return Err(SafeExecError::Runtime(
-                            ExecError::IncompatibleDeviceMemory { index },
-                        ));
-                    }
-                    let exported = self.session.ipc.export_view(memory.as_ref())?;
-                    let buffer_index = intern_buffer(&mut buffers, encode_ipc_buffer(exported));
-                    WireValue::MemOwn {
-                        buffer: buffer_index,
-                        view_offset: exported.view_offset(),
-                        byte_len: exported.byte_len(),
-                    }
-                }
-                Value::MemRef(memory) => {
-                    if memory.backend() != self.session.ipc.backend() {
-                        return Err(SafeExecError::Runtime(
-                            ExecError::IncompatibleDeviceMemory { index },
-                        ));
-                    }
-                    let exported = self.session.ipc.export_view(*memory)?;
-                    let buffer_index = intern_buffer(&mut buffers, encode_ipc_buffer(exported));
-                    WireValue::MemRef {
-                        buffer: buffer_index,
-                        view_offset: exported.view_offset(),
-                        byte_len: exported.byte_len(),
-                    }
-                }
-            };
-            values.push(wire);
-        }
-        if !buffers.is_empty() {
-            self.session.ipc.synchronize()?;
-        }
-        Ok((buffers, values))
-    }
-
-    /// Copies child-owned outputs into parent-owned allocations before releasing them remotely.
-    fn decode_child_outputs(
-        &self,
-        execution: WireExecution,
-    ) -> Result<Vec<Value<'static>>, SafeExecError> {
-        let imported =
-            import_ipc_buffers(&self.session.ipc, execution.buffers).map_err(|error| {
-                SafeExecError::Transport(format!("child memory IPC failed: {error}"))
-            })?;
-        execution
-            .values
-            .into_iter()
-            .map(|value| match value {
-                WireValue::Bool(value) => Ok(Value::Bool(value)),
-                WireValue::U16(value) => Ok(Value::U16(value)),
-                WireValue::U32(value) => Ok(Value::U32(value)),
-                WireValue::U64(value) => Ok(Value::U64(value)),
-                WireValue::F32(value) => Ok(Value::F32(value)),
-                WireValue::MemOwn {
-                    buffer,
-                    view_offset,
-                    byte_len,
-                } => imported
-                    .get(buffer)
-                    .ok_or_else(|| SafeExecError::Transport("invalid IPC memory view".to_string()))?
-                    .copy_view_into_owned(view_offset, byte_len)?
-                    .map(Value::MemOwn)
-                    .ok_or_else(|| SafeExecError::Transport("invalid IPC memory view".to_string())),
-                WireValue::MemRef { .. } => Err(SafeExecError::UnexpectedResponse),
-            })
-            .collect()
-    }
-}
-
-impl Drop for Artifact {
-    fn drop(&mut self) {
-        let Ok(mut worker) = self.session.worker.lock() else {
-            return;
-        };
-        if worker.termination().is_none() {
-            let _ = worker.send(&Request::ReleaseArtifact {
-                artifact: self.remote_id,
-            });
-        }
-    }
-}
-
-fn encode_ipc_buffer(exported: ipc::ExportedIpcView) -> WireIpcBuffer {
-    WireIpcBuffer {
-        handle: exported.handle().map(|handle| handle.as_bytes().to_vec()),
-        allocation_byte_len: exported.allocation_byte_len(),
-    }
-}
-
-fn intern_buffer(buffers: &mut Vec<WireIpcBuffer>, buffer: WireIpcBuffer) -> usize {
-    buffers
-        .iter()
-        .position(|existing| existing == &buffer)
-        .unwrap_or_else(|| {
-            buffers.push(buffer);
-            buffers.len() - 1
-        })
-}
-
-/// Run the SafeRuntime child loop when this executable was spawned as a worker.
+/// The host must also leave `SIGCHLD` waitable for the session lifetime and
+/// must not reap children it did not spawn. Construction rejects `SIG_IGN` and
+/// `SA_NOCLDWAIT`; external `waitpid(-1, ...)` use would violate the exclusive
+/// ownership required by [`std::process::Child`] and the worker's process-group
+/// guard.
 ///
-/// Call this before argument parsing or writing to stdout. The return value is
-/// `false` for a normal invocation and `true` after worker mode finishes.
-pub fn run_safe_runtime_child_if_requested() -> Result<bool, ChildMainError> {
-    if env::var_os(CHILD_MODE_ENV).is_none() {
-        return Ok(false);
-    }
-
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    run_child_loop(stdin.lock(), stdout.lock())?;
-    Ok(true)
-}
-
-fn run_child_loop(mut reader: impl Read, mut writer: impl io::Write) -> Result<(), ChildMainError> {
-    let request = read_request(&mut reader)?.ok_or(ChildMainError::ExpectedInitialization)?;
-    let Request::Initialize { dialect } = request else {
-        return Err(ChildMainError::ExpectedInitialization);
-    };
-
-    let runtime = match Runtime::new(dialect) {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            write_response(&mut writer, &Response::Initialized(Err(error.to_string())))?;
-            return Ok(());
-        }
-    };
-    let ipc = IpcTransport::from_runtime(&runtime);
-    write_response(&mut writer, &Response::Initialized(Ok(())))?;
-
-    let mut artifacts: Vec<Option<RuntimeArtifact>> = Vec::new();
-    let mut pending_outputs = Vec::new();
-    while let Some(request) = read_request(&mut reader)? {
-        match request {
-            Request::Initialize { .. } => return Err(ChildMainError::AlreadyInitialized),
-            Request::LoadModule { module } => {
-                let result = runtime
-                    .load(module)
-                    .map(|artifact| {
-                        let id = artifacts.len();
-                        artifacts.push(Some(artifact));
-                        id
-                    })
-                    .map_err(|error| error.to_string());
-                write_response(&mut writer, &Response::Loaded(result))?;
-            }
-            Request::Shutdown => return Ok(()),
-            Request::ReleaseArtifact { artifact } => {
-                if let Some(artifact) = artifacts.get_mut(artifact) {
-                    *artifact = None;
-                }
-            }
-            Request::ReleaseOutputs => {
-                pending_outputs.clear();
-            }
-            Request::Execute {
-                artifact,
-                name,
-                buffers,
-                args,
-            } => {
-                let response = if pending_outputs.is_empty() {
-                    match artifacts.get(artifact).and_then(Option::as_ref) {
-                        Some(artifact) => execute_in_child(
-                            &ipc,
-                            artifact,
-                            &name,
-                            buffers,
-                            args,
-                            &mut pending_outputs,
-                        ),
-                        None => Response::Executed(Err(RemoteExecError::UnknownArtifact)),
-                    }
-                } else {
-                    Response::Executed(Err(RemoteExecError::Memory(
-                        "previous owned outputs have not been released".to_string(),
-                    )))
-                };
-                write_response(&mut writer, &response)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Copies owned arguments into the child, runs the program, and prepares its outputs for export.
-fn execute_in_child(
-    ipc: &IpcTransport,
-    artifact: &RuntimeArtifact,
-    name: &str,
-    buffers: Vec<WireIpcBuffer>,
-    wire_args: Vec<WireValue>,
-    pending_outputs: &mut Vec<MemOwn>,
-) -> Response {
-    let imported = match import_ipc_buffers(ipc, buffers) {
-        Ok(imported) => imported,
-        Err(error) => return Response::Executed(Err(RemoteExecError::Memory(error))),
-    };
-
-    let args = match wire_args
-        .into_iter()
-        .map(|value| match value {
-            WireValue::Bool(value) => Ok(Value::Bool(value)),
-            WireValue::U16(value) => Ok(Value::U16(value)),
-            WireValue::U32(value) => Ok(Value::U32(value)),
-            WireValue::U64(value) => Ok(Value::U64(value)),
-            WireValue::F32(value) => Ok(Value::F32(value)),
-            WireValue::MemRef {
-                buffer,
-                view_offset,
-                byte_len,
-            } => imported
-                .get(buffer)
-                .and_then(|allocation| allocation.as_mem_ref(view_offset, byte_len))
-                .map(Value::MemRef)
-                .ok_or_else(|| "invalid IPC memory view".to_string()),
-            WireValue::MemOwn {
-                buffer,
-                view_offset,
-                byte_len,
-            } => imported
-                .get(buffer)
-                .ok_or_else(|| "invalid IPC memory view".to_string())?
-                .copy_view_into_owned(view_offset, byte_len)
-                .map_err(|error| error.to_string())?
-                .map(Value::MemOwn)
-                .ok_or_else(|| "invalid IPC memory view".to_string()),
-        })
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(args) => args,
-        Err(error) => return Response::Executed(Err(RemoteExecError::Memory(error))),
-    };
-
-    let values = match artifact.exec_values(name, args) {
-        Ok(values) => values,
-        Err(error) => return Response::Executed(Err(RemoteExecError::Runtime(error))),
-    };
-    if let Err(error) = ipc.synchronize() {
-        return Response::Executed(Err(RemoteExecError::Memory(error.to_string())));
-    }
-    match encode_child_outputs(ipc, values, pending_outputs) {
-        Ok(execution) => Response::Executed(Ok(execution)),
-        Err(error) => {
-            pending_outputs.clear();
-            Response::Executed(Err(error))
-        }
-    }
-}
-
-fn import_ipc_buffers(
-    ipc: &IpcTransport,
-    buffers: Vec<WireIpcBuffer>,
-) -> Result<Vec<ImportedIpcAllocation>, String> {
-    buffers
-        .into_iter()
-        .map(|buffer| {
-            if buffer.handle.is_none() && buffer.allocation_byte_len != 0 {
-                return Err("non-empty IPC allocation has no handle".to_string());
-            }
-            let handle =
-                buffer
-                    .handle
-                    .map(|bytes| {
-                        bytes.try_into().map(IpcMemoryHandle::from_bytes).map_err(
-                            |bytes: Vec<u8>| format!("IPC memory handle has {} bytes", bytes.len()),
-                        )
-                    })
-                    .transpose()?;
-            ipc.import_allocation(handle, buffer.allocation_byte_len)
-                .map_err(|error| error.to_string())
-        })
-        .collect()
-}
-
-/// Exports owned outputs and retains them until the parent confirms it has copied them.
-fn encode_child_outputs(
-    ipc: &IpcTransport,
-    values: Vec<Value<'static>>,
-    pending_outputs: &mut Vec<MemOwn>,
-) -> Result<WireExecution, RemoteExecError> {
-    let mut buffers = Vec::new();
-    let mut wire_values = Vec::with_capacity(values.len());
-    for value in values {
-        let wire = match value {
-            Value::Bool(value) => WireValue::Bool(value),
-            Value::U16(value) => WireValue::U16(value),
-            Value::U32(value) => WireValue::U32(value),
-            Value::U64(value) => WireValue::U64(value),
-            Value::F32(value) => WireValue::F32(value),
-            Value::MemOwn(memory) => {
-                let exported = ipc
-                    .export_view(memory.as_ref())
-                    .map_err(|error| RemoteExecError::Memory(error.to_string()))?;
-                let buffer = intern_buffer(&mut buffers, encode_ipc_buffer(exported));
-                let value = WireValue::MemOwn {
-                    buffer,
-                    view_offset: exported.view_offset(),
-                    byte_len: exported.byte_len(),
-                };
-                pending_outputs.push(memory);
-                value
-            }
-            Value::MemRef(_) => unreachable!("Runtime rejects borrowed memory outputs"),
-        };
-        wire_values.push(wire);
-    }
-    Ok(WireExecution {
-        buffers,
-        values: wire_values,
-    })
-}
-
-fn read_request(reader: &mut impl Read) -> Result<Option<Request>, ChildMainError> {
-    read_frame(reader).map_err(child_protocol_error)
-}
-
-fn write_response(writer: &mut impl io::Write, response: &Response) -> Result<(), ChildMainError> {
-    write_frame(writer, response).map_err(child_protocol_error)
-}
-
-fn child_protocol_error(error: ProtocolError) -> ChildMainError {
-    ChildMainError::Protocol(error.to_string())
-}
-
+/// Worker-retirement admission is process-local. A changed PID resets copied
+/// admission counters so an exec-style fork child does not inherit its parent's
+/// retired leaders. Live `SafeRuntime` values themselves are not fork-safe:
+/// after a multi-threaded fork, the child must exec rather than use or drop
+/// inherited sessions and synchronization primitives. Independently launched
+/// host processes require a deployment-level memory/cgroup boundary.
+///
+/// The worker intentionally inherits the host environment except for `TMPDIR`,
+/// which is replaced by a private, parent-owned scratch directory. GPU runtime
+/// and compiler discovery currently depend on platform-specific variables such
+/// as `PATH`, `ROCM_PATH`, `HIP_PATH`, `CUDA_PATH`, and loader/wrapper settings;
+/// there is no portable safe allowlist at this layer. Deployments that require
+/// environment isolation must start the host process with a curated environment
+/// rather than assuming `SafeRuntime` clears it.
+///
+/// This lower-level interface supports raw [`crate::runtime::Value`] memory across the process
+/// boundary, so its public constructors initialize GPU IPC in the parent. The
+/// typed [`Session`] interface keeps all device memory in the
+/// worker and therefore loads the native GPU runtime only there.
 #[derive(Debug, Clone)]
-struct Termination {
-    status: ExitStatus,
-    stderr: String,
+pub struct SafeRuntime {
+    backend: Backend,
+    executable: PathBuf,
+    worker: Arc<Mutex<WorkerProcess>>,
+    asset_owner: Option<Arc<SafeRuntime>>,
+    operation_gate: Arc<SessionOperationGate>,
+    parent_ipc: Option<IpcTransport>,
+    runtime_id: RuntimeId,
+    timeouts: SafeRuntimeTimeouts,
+}
+
+/// A compiled program that retains its isolated worker after `SafeRuntime`
+/// is dropped. Its final clone releases child-side artifact state.
+#[derive(Debug, Clone)]
+pub struct Artifact {
+    inner: Arc<RemoteArtifact>,
 }
 
 #[derive(Debug)]
-struct WorkerProcess {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
-    stderr_reader: Option<JoinHandle<Vec<u8>>>,
-    termination: Option<Termination>,
+struct RemoteArtifact {
+    runtime: SafeRuntime,
+    index: usize,
+    entry_points: Arc<[EntryPoint]>,
 }
 
-#[derive(Debug, Error)]
-enum WorkerError {
-    #[error(transparent)]
-    Protocol(#[from] ProtocolError),
-    #[error("failed to wait for SafeRuntime child: {0}")]
-    Wait(#[source] io::Error),
-    #[error("SafeRuntime child terminated")]
-    Terminated(Termination),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentInterface {
+    RawValues,
+    ResidentProtocol,
+    AssetOwner,
 }
 
-impl WorkerProcess {
-    fn spawn(executable: &Path) -> Result<Self, SafeInitError> {
-        let mut child = Command::new(executable)
-            .env(CHILD_MODE_ENV, "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| SafeInitError::Spawn {
-                executable: executable.to_path_buf(),
-                source,
-            })?;
-        let stdin = child
-            .stdin
-            .take()
-            .expect("piped child stdin should be available");
-        let stdout = child
-            .stdout
-            .take()
-            .expect("piped child stdout should be available");
-        let mut stderr = child
-            .stderr
-            .take()
-            .expect("piped child stderr should be available");
-        let stderr_reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stderr.read_to_end(&mut bytes);
-            bytes
-        });
-
-        Ok(Self {
-            child,
-            stdin: Some(stdin),
-            stdout: BufReader::new(stdout),
-            stderr_reader: Some(stderr_reader),
-            termination: None,
-        })
-    }
-
-    fn send(&mut self, request: &Request) -> Result<(), WorkerError> {
-        let Some(stdin) = self.stdin.as_mut() else {
-            return Err(WorkerError::Terminated(
-                self.termination
-                    .clone()
-                    .expect("closed worker stdin should have termination state"),
-            ));
-        };
-        write_frame(stdin, request).map_err(WorkerError::Protocol)
-    }
-
-    fn receive(&mut self) -> Result<Response, WorkerError> {
-        match read_frame(&mut self.stdout).map_err(WorkerError::Protocol)? {
-            Some(response) => Ok(response),
-            None => Err(WorkerError::Terminated(self.reap()?)),
-        }
-    }
-
-    fn termination(&self) -> Option<&Termination> {
-        self.termination.as_ref()
-    }
-
-    fn reap(&mut self) -> Result<Termination, WorkerError> {
-        if let Some(termination) = &self.termination {
-            return Ok(termination.clone());
-        }
-        self.stdin.take();
-        let status = self.child.wait().map_err(WorkerError::Wait)?;
-        let stderr = self.take_stderr();
-        let termination = Termination { status, stderr };
-        self.termination = Some(termination.clone());
-        Ok(termination)
-    }
-
-    fn take_stderr(&mut self) -> String {
-        let bytes = self
-            .stderr_reader
-            .take()
-            .and_then(|reader| reader.join().ok())
-            .unwrap_or_default();
-        String::from_utf8_lossy(&bytes).trim().to_string()
+fn initialize_parent_ipc<T, E>(
+    interface: ParentInterface,
+    load: impl FnOnce() -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    match interface {
+        ParentInterface::RawValues => load().map(Some),
+        ParentInterface::ResidentProtocol | ParentInterface::AssetOwner => Ok(None),
     }
 }
 
-impl Drop for WorkerProcess {
-    fn drop(&mut self) {
-        if self.termination.is_none() {
-            if let Some(stdin) = self.stdin.as_mut() {
-                let _ = write_frame(stdin, &Request::Shutdown);
-            }
-            self.stdin.take();
-            let _ = self.child.wait();
-        }
-        if self.stderr_reader.is_some() {
-            let _ = self.take_stderr();
-        }
-    }
-}
+mod artifact;
+mod child;
+mod deadline;
+mod lifecycle;
+mod operation;
+mod session;
+mod worker;
 
-fn map_init_worker_error(error: WorkerError) -> SafeInitError {
-    match error {
-        WorkerError::Terminated(termination) => SafeInitError::ChildTerminated {
-            status: termination.status,
-            stderr: termination.stderr,
-        },
-        other => SafeInitError::Transport(other.to_string()),
-    }
-}
+pub use child::run_safe_runtime_child_if_requested;
 
-fn map_exec_worker_error(error: WorkerError) -> SafeExecError {
-    match error {
-        WorkerError::Terminated(termination) => SafeExecError::ChildTerminated {
-            status: termination.status,
-            stderr: termination.stderr,
-        },
-        other => SafeExecError::Transport(other.to_string()),
-    }
-}
+#[cfg(test)]
+mod error_tests;

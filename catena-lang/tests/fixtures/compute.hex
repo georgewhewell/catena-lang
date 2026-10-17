@@ -1,0 +1,112 @@
+# Small standalone programs using the current GPU standard library. The test
+# kernels use explicit unsafe.assume resource proofs and exercise real device loads,
+# writes and allocations through the normal compiler and runtime services.
+(def program compute-u64-add : {(u64 val) (u64 val)} -> (u64 val)
+= ({smolcat.value.named smolcat.value.named stdlib.numeric.numeric.u64} stdlib.numeric.+ :.forget))
+
+(def program compute-u64-multiply : {(u64 val) (u64 val)} -> (u64 val)
+= ({smolcat.value.named smolcat.value.named stdlib.numeric.numeric.u64} stdlib.numeric.* :.forget))
+
+# The byte allocator receives bytes, so reject overflowing element counts before
+# multiplying. This must fail inside the worker, without allocating a short buffer.
+(def program compute-bytes : (u64 val) -> (u64 val)
+= ([length.]
+  ({[.length] const.u64.0x1fffffffffffffff stdlib.numeric.numeric.u64}
+    stdlib.numeric.less_equal smolcat.value.named stdlib.assert.assert_true [unit proof.])
+  ({[.length] const.u64.0x0000000000000008} compute-u64-multiply)))
+
+(def program compute-fill : {(u64 val) (u64 val)} -> ((cap.own mem) val)
+= ([length value.]
+  ([.length] smolcat.value.named [count.])
+  ({([.length] compute-bytes) stdlib.gpu.memory.memoryelement.u64} stdlib.gpu.memory.allocate [memory.])
+  ({[.memory count]} stdlib.gpu.memory.global_own_u64 [global allocation available.])
+  ({[.count] type.const.u64.0x0000000000000001
+    type.const.u64.0x0000000000000001 type.const.u64.0x0000000000000001}
+    stdlib.gpu.geometry.make_grid [grid bounds.])
+  ({[.grid]
+    ({([.count] :.param) ([.grid] :.param) (unit.intro smolcat.callback.symbol)
+      ([.global] :.forget) [.value]} partial.compute-fill-kernel.2)}
+    unsafe.launch [done.])
+  ({[.global allocation]} stdlib.gpu.memory.global_u64_to_mem)))
+
+# Fill each output word with the first borrowed input word plus delta.
+(def program compute-add-fill : {((cap.ref mem) val) (u64 val) (u64 val)} -> ((cap.own mem) val)
+= ([input length delta.]
+  ([.length] smolcat.value.named [count.])
+  ({[.input] type.const.u64.0x0000000000000001} stdlib.gpu.memory.global_ref_u64 [source readable.])
+  ({([.length] compute-bytes) stdlib.gpu.memory.memoryelement.u64} stdlib.gpu.memory.allocate [memory.])
+  ({[.memory count]} stdlib.gpu.memory.global_own_u64 [global allocation available.])
+  ({[.count] type.const.u64.0x0000000000000001
+    type.const.u64.0x0000000000000001 type.const.u64.0x0000000000000001}
+    stdlib.gpu.geometry.make_grid [grid bounds.])
+  ({[.grid]
+    ({([.count] :.param) ([.grid] :.param) (unit.intro smolcat.callback.symbol)
+      ([.source] :.forget) ([.global] :.forget) [.delta]} partial.compute-add-kernel.3)}
+    unsafe.launch [done.])
+  ({[.global allocation]} stdlib.gpu.memory.global_u64_to_mem)))
+
+(def program compute-add : {((cap.ref mem) val) (u64 val)} -> ((cap.own mem) val)
+= ([input delta.] {[.input] const.u64.0x0000000000000001 [.delta]} compute-add-fill))
+
+(def program compute-return :
+  {(bool val) (u32 val) (u64 val) (f32 val) ((cap.own mem) val)} ->
+  {(bool val) (u32 val) (u64 val) (f32 val) ((cap.own mem) val)}
+= [a b c d e])
+
+(def program compute-empty : [] -> ((cap.own mem) val)
+= ({const.u64.0x0000000000000000 stdlib.gpu.memory.memoryelement.u64} stdlib.gpu.memory.allocate))
+
+(def program compute-owned : ((cap.own mem) val) -> ((cap.own mem) val) = [buffer])
+
+(def program compute-free : ((cap.own mem) val) -> []
+= (stdlib.gpu.memory.mem_cast_own_u64
+   (*.elim {_ (*.elim {_ (*.elim {_ _})})}) [count global allocation readable.]
+   {[.global allocation]} stdlib.gpu.memory.free unit.elim))
+
+(def program compute-fault : (u64 val) -> ((cap.own mem) val)
+= ([_ignored.] {const.u64.0xffffffffffffffff const.u64.0x0000000000000001} compute-fill))
+
+(def program compute-fill-kernel : ([n g b.] {({[.n] u64} stdlib.gpu.memory.type.Global val) (u64 val) ({({[.b] ({({[.n] type.const.u64.0x0000000000000001} stdlib.gpu.geometry.sort.D2) ({type.const.u64.0x0000000000000001 type.const.u64.0x0000000000000001} stdlib.gpu.geometry.sort.D2) [.g]} stdlib.gpu.geometry.type.Block)} :) ({({[.n] type.const.u64.0x0000000000000001} stdlib.gpu.geometry.sort.D2) ({type.const.u64.0x0000000000000001 type.const.u64.0x0000000000000001} stdlib.gpu.geometry.sort.D2) [.g] [.b]} stdlib.gpu.geometry.type.Thread val)} *)}) -> ([n g b.] 1)
+= ([memory value pair.]
+  ([.memory] smolcat.value.named [global.])
+  ([.pair] (*.elim {_ _}) [block thread.])
+  ([.thread] smolcat.value.named stdlib.gpu.geometry.in_grid_index stdlib.gpu.geometry.x [index.])
+  ({[.global index]} meta.compute.index-proposition [global2 index2 proposition.])
+  ({unit.intro ([.proposition] name.unsafe.assume lift)} evaluate [bound.])
+  ({[.index2 bound]} stdlib.gpu.memory.ix [ix.])
+  ({[.global2 ix]} meta.compute.write-proposition [global3 ix3 proposition2.])
+  ({unit.intro ([.proposition2] name.unsafe.assume lift)} evaluate [permission.])
+  ({[.global3 ix3 value permission]} stdlib.gpu.memory.global_write)))
+
+(def program compute-add-kernel : ([n g b.] {({type.const.u64.0x0000000000000001 u64} stdlib.gpu.memory.type.Global val) ({[.n] u64} stdlib.gpu.memory.type.Global val) (u64 val) ({({[.b] ({({[.n] type.const.u64.0x0000000000000001} stdlib.gpu.geometry.sort.D2) ({type.const.u64.0x0000000000000001 type.const.u64.0x0000000000000001} stdlib.gpu.geometry.sort.D2) [.g]} stdlib.gpu.geometry.type.Block)} :) ({({[.n] type.const.u64.0x0000000000000001} stdlib.gpu.geometry.sort.D2) ({type.const.u64.0x0000000000000001 type.const.u64.0x0000000000000001} stdlib.gpu.geometry.sort.D2) [.g] [.b]} stdlib.gpu.geometry.type.Thread val)} *)}) -> ([n g b.] 1)
+= ([source memory delta pair.]
+  ([.memory] smolcat.value.named [global.])
+  ([.pair] (*.elim {_ _}) [block thread.])
+  ({unit.intro (meta.compute.zero-proposition name.unsafe.assume lift)} evaluate [bound0.])
+  ({type.const.u64.0x0000000000000000 [.bound0]} stdlib.gpu.memory.ix :.forget [zero.])
+  ({[.source zero]} stdlib.gpu.memory.global_read_unsafe [first.])
+  ({[.first delta]} compute-u64-add [value.])
+  ([.thread] smolcat.value.named stdlib.gpu.geometry.in_grid_index stdlib.gpu.geometry.x [index.])
+  ({[.global index]} meta.compute.index-proposition [global2 index2 proposition.])
+  ({unit.intro ([.proposition] name.unsafe.assume lift)} evaluate [bound.])
+  ({[.index2 bound]} stdlib.gpu.memory.ix [ix.])
+  ({[.global2 ix]} meta.compute.write-proposition [global3 ix3 proposition2.])
+  ({unit.intro ([.proposition2] name.unsafe.assume lift)} evaluate [permission.])
+  ({[.global3 ix3 value permission]} stdlib.gpu.memory.global_write)))
+
+# These meta projections expose only type witnesses, as in upstream's generated
+# fixtures. Runtime permission proofs are constructed explicitly with unsafe.assume.
+(theory program type {
+(arr meta.compute.index-proposition :
+  ([n g i.] {({[.g] ({[.n] u64} stdlib.gpu.memory.type.Global)} :) ({[.i] u64} :)}) ->
+  ([n g i.] {({[.g] ({[.n] u64} stdlib.gpu.memory.type.Global)} :) ({[.i] u64} :) ({[.i] [.n]} prop.Less)}))
+
+(arr meta.compute.write-proposition :
+  ([n g i.] {({[.g] ({[.n] u64} stdlib.gpu.memory.type.Global)} :) ({[.i] ([.n] stdlib.gpu.memory.type.Ix)} :)}) ->
+  ([n g i.] {({[.g] ({[.n] u64} stdlib.gpu.memory.type.Global)} :) ({[.i] ([.n] stdlib.gpu.memory.type.Ix)} :)
+    ({1 1 1 1 [.n] u64 1 [.g] [.i]} stdlib.gpu.memory.prop.GlobalOwn)}))
+
+(arr meta.compute.zero-proposition : [] ->
+  ({type.const.u64.0x0000000000000000 type.const.u64.0x0000000000000001} prop.Less))
+
+})

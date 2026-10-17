@@ -20,6 +20,10 @@ pub enum MemError {
         bytes: u64,
         length: u64,
     },
+    #[error("invalid shared GPU allocation: {reason}")]
+    InvalidSharedAllocation { reason: &'static str },
+    #[error("failed to manage shared GPU allocation descriptor: {0}")]
+    SharedHandleIo(#[source] std::io::Error),
     #[error("no usable {backend} GPU device is available")]
     NoDevice { backend: Backend },
     #[error(
@@ -194,7 +198,7 @@ impl MemOwn {
 
     /// The native GPU dialect, retained for existing runtime callers.
     pub fn dialect(&self) -> GpuDialect {
-        self.backend().dialect().expect("native GPU allocation")
+        self.gpu.dialect()
     }
 
     pub fn as_ref(&self) -> MemRef<'_> {

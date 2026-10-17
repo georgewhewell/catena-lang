@@ -6,6 +6,8 @@ use std::{
     process::{Command, ExitStatus},
 };
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use thiserror::Error;
 
 use super::GpuDialect;
@@ -26,6 +28,20 @@ pub enum ArtifactError {
         status: ExitStatus,
         stderr: String,
     },
+}
+
+static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct RuntimeId(u64);
+
+impl RuntimeId {
+    pub(crate) fn new() -> Self {
+        let id = NEXT_RUNTIME_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("runtime ID space exhausted");
+        Self(id)
+    }
 }
 
 /// A shared object file created by compiling generated Catena GPU C++.

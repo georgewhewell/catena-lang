@@ -127,3 +127,31 @@ fn dialect_alloc(dialect: GpuDialect) -> &'static str {
         GpuDialect::Cuda => "cudaMalloc",
     }
 }
+
+#[test]
+fn embedding_programs_compile_for_both_dialects() -> anyhow::Result<()> {
+    let raw = RawTheorySet::from_texts(catena_lang::stdlib::sources().chain([
+        include_str!("fixtures/compute.hex"),
+        include_str!("fixtures/publication.hex"),
+    ]))?;
+    for dialect in [GpuDialect::Hip, GpuDialect::Cuda] {
+        let mut report = CompileReport::new(raw.clone());
+        let module = compile(&mut report, codegen::CodegenKind::Default, dialect)?;
+        for name in [
+            "compute-fill",
+            "compute-add",
+            "compute-add-fill",
+            "compute-return",
+            "compute-owned",
+            "compute-fault",
+            "publish-pair",
+            "publish-changed",
+        ] {
+            assert!(
+                module.functions.iter().any(|f| f.source_name == name),
+                "{name} is not exported"
+            );
+        }
+    }
+    Ok(())
+}

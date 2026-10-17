@@ -90,6 +90,7 @@ pub mod module_abi;
 //mod tests;
 
 pub use artifact::ArtifactError;
+pub(crate) use artifact::RuntimeId;
 pub use dialect::GpuDialect;
 pub use mem::MemError;
 pub use mem::MemOwn;
