@@ -1,11 +1,11 @@
-//! Host services shared by every code generator: metered device allocation,
-//! exported under the names in [`crate::runtime::module_abi`].
+//! Host services shared by every code generator: metered device allocation and
+//! output publication, exported under the names in [`crate::runtime::module_abi`].
 
 use crate::runtime::{GpuDialect, module_abi};
 
 /// Render the services for `dialect`. They are host-only and must follow the
-/// standard headers; `catena_runtime_allocate` is the entry point generated host
-/// code calls.
+/// standard headers; `catena_runtime_allocate` and `catena_runtime_publish` are the
+/// entry points generated host code calls.
 pub(crate) fn render(dialect: GpuDialect) -> String {
     format!(
         r#"#ifndef {guard}
@@ -58,11 +58,34 @@ __host__ static inline void *catena_runtime_allocate(uint64_t element_count, uin
     return data;
 }}
 
+// Output publication is scoped to one invocation, like allocation accounting.
+// The callback runs synchronously on this host thread while the owner is live.
+typedef uint8_t (*catena_publication_callback_t)(void *, uint64_t, const void *, uint64_t);
+static thread_local void *catena_runtime_publication_context = nullptr;
+static thread_local catena_publication_callback_t catena_runtime_publication_callback = nullptr;
+
+extern "C" __host__ void {set_publication}(void *context, catena_publication_callback_t callback) {{
+    catena_runtime_publication_context = context;
+    catena_runtime_publication_callback = callback;
+}}
+
+// Publish the first `bytes` of output `output`, which currently holds `len` bytes at `data`.
+__host__ static inline void catena_runtime_publish(
+    const void *data, uint64_t len, uint64_t output, uint64_t bytes
+) {{
+    if (bytes > len || catena_runtime_publication_callback == nullptr) {{
+        catena_runtime_reject("invalid output publication");
+    }}
+    if (!catena_runtime_publication_callback(catena_runtime_publication_context, output, data, bytes)) {{
+        catena_runtime_reject("output publication cancelled");
+    }}
+}}
 #endif
 "#,
         guard = dialect.device_compile_guard(),
         budget_begin = module_abi::ALLOCATION_BUDGET_BEGIN,
         budget_end = module_abi::ALLOCATION_BUDGET_END,
+        set_publication = module_abi::SET_PUBLICATION_CALLBACK,
         error_type = dialect.error_type(),
         device_alloc = dialect.device_alloc_fn(),
         success = dialect.success_value(),

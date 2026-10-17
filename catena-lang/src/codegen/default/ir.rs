@@ -35,6 +35,12 @@ pub(super) enum Instruction {
         yes: Vec<Instruction>,
         no: Vec<Instruction>,
     },
+    /// Copy a prefix to the invocation's host publication callback.
+    Publish {
+        buffer: Variable,
+        output: Variable,
+        bytes: Variable,
+    },
     Free {
         buffer: Variable,
     },

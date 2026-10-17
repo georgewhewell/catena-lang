@@ -10,6 +10,9 @@ pub(super) fn render(modules: &Modules, dialect: GpuDialect) -> String {
     }
     for (kernel, functions) in [(true, &modules.kernels), (false, &modules.functions)] {
         for f in functions.values() {
+            if !kernel {
+                writeln!(out, "#ifndef {}", dialect.device_compile_guard()).unwrap();
+            }
             let mut parameters = f
                 .inputs
                 .iter()
@@ -41,6 +44,9 @@ pub(super) fn render(modules: &Modules, dialect: GpuDialect) -> String {
             out.push_str("}\n");
             if let Some(checks) = modules.argument_checks.get(&f.symbol) {
                 super::abi::render_argument_check(&mut out, f, checks, dialect);
+            }
+            if !kernel {
+                out.push_str("#endif\n");
             }
         }
     }
@@ -101,6 +107,18 @@ fn render_body(out: &mut String, body: &[Instruction], depth: usize, dialect: Gp
                     out,
                     "{indent}{}.data[{}] = {};",
                     buffer.name, index.name, value.name
+                )
+                .unwrap();
+            }
+            Instruction::Publish {
+                buffer,
+                output,
+                bytes,
+            } => {
+                writeln!(
+                    out,
+                    "{indent}catena_runtime_publish({0}.data, {0}.len, {1}, {2});",
+                    buffer.name, output.name, bytes.name
                 )
                 .unwrap();
             }

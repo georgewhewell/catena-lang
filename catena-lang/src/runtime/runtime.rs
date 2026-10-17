@@ -341,6 +341,56 @@ impl Artifact {
         self.exec_symbol_with_generated_allocation_budget(name, signature, args, Some(byte_limit))
     }
 
+    /// Run a source-level program while observing published output prefixes.
+    ///
+    /// GPU pointers stay inside the synchronous generated call; `notify` receives
+    /// bounded host copies of each newly published range and returns `false` to
+    /// cancel. Cancellation and invalid publications trap the executing process,
+    /// like a failed Catena assertion; containment requires a worker process.
+    /// `notify` must not call this artifact again; such calls return
+    /// [`ExecError::ReentrantCall`].
+    /// Allocations made by generated code are bounded as in
+    /// [`Self::exec_values_with_generated_allocation_budget`].
+    pub fn exec_values_with_publication<'a>(
+        &self,
+        name: &str,
+        args: Vec<Value<'a>>,
+        allocation_limit: u64,
+        maximum_output_bytes: u64,
+        notify: &mut dyn FnMut(super::Publication) -> bool,
+    ) -> Result<Vec<Value<'static>>, ExecError> {
+        let signature = self
+            .signatures
+            .get(name)
+            .ok_or_else(|| ExecError::UnknownSourceFunction(name.to_string()))?;
+        let mut publisher = super::publication::Publisher {
+            gpu: &self.gpu,
+            outputs: &signature.outputs,
+            lengths: vec![0; signature.outputs.len()],
+            maximum_bytes: maximum_output_bytes,
+            total_bytes: 0,
+            notify,
+        };
+        let executor = &self.executor;
+        let _active = executor.enter().ok_or(ExecError::ReentrantCall)?;
+        if !executor.supports_allocation_budget() {
+            return Err(ExecError::AllocationBudgetUnavailable);
+        }
+        if !executor.supports_publication() {
+            // A module without the publication service cannot publish.
+            return self.exec_entered(name, signature, args, Some(allocation_limit));
+        }
+        // Publisher and callback remain live for this synchronous call. The
+        // executor resets the generated-library callback before returning.
+        unsafe {
+            executor.with_publication(
+                (&mut publisher as *mut super::publication::Publisher<'_>).cast(),
+                super::publication::callback,
+                || self.exec_entered(name, signature, args, Some(allocation_limit)),
+            )
+        }
+    }
+
     fn exec_symbol<'a>(
         &self,
         name: &str,

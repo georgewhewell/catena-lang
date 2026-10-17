@@ -35,6 +35,22 @@ fn validate_body(
 ) -> Result<(), CodegenError> {
     for instruction in body {
         match instruction {
+            Instruction::Publish {
+                buffer,
+                output,
+                bytes,
+            } => {
+                if place != Place::Host
+                    || buffer.ty != CType::MemOwn
+                    || output.ty != CType::U64
+                    || bytes.ty != CType::U64
+                {
+                    return Err(error(
+                        function,
+                        "publication requires owned memory and two u64 arguments on the host",
+                    ));
+                }
+            }
             Instruction::Free { buffer } => {
                 if place != Place::Host || !matches!(buffer.ty, CType::Global(_)) {
                     return Err(error(function, "free requires a global buffer on the host"));
@@ -259,5 +275,30 @@ mod tests {
         assert!(validate(&host).is_ok());
         host.kernels.get_mut("kernel").unwrap().body = nested(vec![launch]);
         assert!(validate(&host).is_err());
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    #[test]
+    fn publication_is_host_only_even_in_nested_control_flow() {
+        let variable = |name: &str, ty| Variable {
+            name: name.into(),
+            ty,
+        };
+        let publish = Instruction::Publish {
+            buffer: variable("buffer", CType::MemOwn),
+            output: variable("output", CType::U64),
+            bytes: variable("bytes", CType::U64),
+        };
+        let modules = Modules::default();
+        let body = vec![Instruction::If {
+            condition: "true".into(),
+            yes: vec![publish],
+            no: vec![],
+        }];
+        assert!(validate_body(&modules, "publish", Place::Host, &body).is_ok());
+        assert!(validate_body(&modules, "publish", Place::Device, &body).is_err());
     }
 }

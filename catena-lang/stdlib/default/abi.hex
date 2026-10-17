@@ -5,3 +5,8 @@
 
   (arr mem : 1 -> 1)
 })
+
+# Publish an owned output's byte prefix without transferring ownership.
+(theory program type {
+  (arr mem.publish : {((cap.own mem) val) (u64 val) (u64 val)} -> ((cap.own mem) val))
+})

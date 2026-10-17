@@ -92,3 +92,37 @@ fn foreign_calls_validate_dependent_sizes_and_indices_before_execution() -> anyh
     assert_eq!(index, 7);
     Ok(())
 }
+
+#[test]
+fn publication_streams_prefixes_and_rejects_reentry() -> anyhow::Result<()> {
+    let (runtime, artifact) = support::runtime_with_source(
+        "(def program publish-prefix : {((cap.own mem) val) (u64 val) (u64 val)} -> ((cap.own mem) val) = mem.publish)",
+    )?;
+    let values = [1_u64, 2, 3, 4];
+    let buffer = runtime.mem_u64(&values)?;
+    let mut published = Vec::new();
+    let mut nested = None;
+    let outputs = artifact.exec_values_with_publication(
+        "publish-prefix",
+        vec![buffer.into(), 0_u64.into(), 16_u64.into()],
+        u64::MAX,
+        64,
+        &mut |publication| {
+            assert_eq!(publication.output, 0);
+            published.extend_from_slice(&publication.bytes);
+            nested.get_or_insert_with(|| artifact.exec_values("publish-prefix", vec![]));
+            true
+        },
+    )?;
+    let [Value::MemOwn(output)] = outputs.as_slice() else {
+        anyhow::bail!("publish-prefix returned {outputs:?}");
+    };
+    assert_eq!(output.try_to_u64_vec()?, values);
+    let expected = values[..2]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    assert_eq!(published, expected);
+    assert!(matches!(nested, Some(Err(ExecError::ReentrantCall))));
+    Ok(())
+}

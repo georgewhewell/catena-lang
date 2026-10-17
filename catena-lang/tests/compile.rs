@@ -96,6 +96,7 @@ fn every_code_generator_exports_the_runtime_services() -> anyhow::Result<()> {
             for symbol in [
                 module_abi::ALLOCATION_BUDGET_BEGIN,
                 module_abi::ALLOCATION_BUDGET_END,
+                module_abi::SET_PUBLICATION_CALLBACK,
             ] {
                 assert!(
                     module

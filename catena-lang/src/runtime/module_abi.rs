@@ -6,8 +6,8 @@
 //! they control is per host thread and scoped to one entry-point invocation; the
 //! runtime does not re-enter a module while one of its calls is in progress.
 //!
-//! The services are optional: a module without them still loads and runs
-//! without a generated-allocation limit.
+//! The services are optional: a module without them still loads, runs without a
+//! generated-allocation limit and cannot publish outputs.
 //!
 //! A generator owns the safety of its entry points. It must not export an entry
 //! point whose inputs carry a relation that its code relies on but neither checks
@@ -25,6 +25,12 @@ pub const ALLOCATION_BUDGET_BEGIN: &str = "catena_generated_allocation_budget_be
 
 /// `extern "C" void ()`: stop charging and lift the limit.
 pub const ALLOCATION_BUDGET_END: &str = "catena_generated_allocation_budget_end";
+
+/// `extern "C" void (void *context, uint8_t (*callback)(void *context, uint64_t output,
+/// const void *device_data, uint64_t bytes))`: install the callback that observes
+/// published output prefixes, or clear it with a null callback. A zero return
+/// from the callback cancels the invocation by trapping the process.
+pub const SET_PUBLICATION_CALLBACK: &str = "catena_set_publication_callback";
 
 /// Name of an entry point's optional argument check.
 ///

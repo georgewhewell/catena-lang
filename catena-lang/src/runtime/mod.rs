@@ -74,6 +74,8 @@ mod module_cache;
 mod artifact;
 mod backend;
 pub use backend::Backend;
+mod publication;
+pub use publication::{MAX_PUBLICATION_CHUNK_BYTES, Publication};
 
 /// Marshal catena values into the C ABI and invoke compiled symbols
 mod executor;

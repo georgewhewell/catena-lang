@@ -10,6 +10,15 @@ use super::{module_abi, signature::SignatureTable, value::ValueKind};
 
 type AllocationBudgetBegin = unsafe extern "C" fn(u64);
 type AllocationBudgetEnd = unsafe extern "C" fn();
+pub(super) type PublicationCallback =
+    unsafe extern "C" fn(*mut c_void, u64, *const c_void, u64) -> u8;
+type SetPublication = unsafe extern "C" fn(*mut c_void, Option<PublicationCallback>);
+struct PublicationReset(SetPublication);
+impl Drop for PublicationReset {
+    fn drop(&mut self) {
+        unsafe { (self.0)(std::ptr::null_mut(), None) };
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -110,6 +119,7 @@ pub(super) struct Executor {
     _library: Library,
     functions: HashMap<String, PreparedFunction>,
     allocation_budget: Option<AllocationBudgetControl>,
+    publication: Option<SetPublication>,
 }
 
 #[derive(Debug, Error)]
@@ -126,7 +136,7 @@ impl Executor {
     /// Resolve generated entry points and prepare their libffi call interfaces once.
     ///
     /// The module's service symbols are optional: a module without them still
-    /// runs, but cannot meter its allocations.
+    /// runs, but cannot meter its allocations or publish outputs.
     pub(super) fn new(
         library: Library,
         signatures: &SignatureTable,
@@ -138,6 +148,7 @@ impl Executor {
             (Some(begin), Some(end)) => Some(AllocationBudgetControl { begin, end }),
             _ => None,
         };
+        let publication = optional_symbol(&library, module_abi::SET_PUBLICATION_CALLBACK);
         let mut functions = HashMap::with_capacity(signatures.len());
         for signature in signatures.values() {
             if functions.contains_key(&signature.symbol) {
@@ -179,6 +190,7 @@ impl Executor {
             _library: library,
             functions,
             allocation_budget,
+            publication,
         })
     }
 
@@ -207,6 +219,10 @@ impl Executor {
 
     pub(super) fn supports_allocation_budget(&self) -> bool {
         self.allocation_budget.is_some()
+    }
+
+    pub(super) fn supports_publication(&self) -> bool {
+        self.publication.is_some()
     }
 
     /// Run the module's argument check for `symbol`, if it provides one, and
@@ -249,6 +265,22 @@ impl Executor {
             active.push(executor);
             Some(ActiveCall(executor))
         })
+    }
+
+    // SAFETY: context and callback must remain valid on this thread until invoke
+    // returns. The generated library cannot retain them after the reset guard.
+    pub(super) unsafe fn with_publication<T>(
+        &self,
+        context: *mut c_void,
+        callback: PublicationCallback,
+        invoke: impl FnOnce() -> T,
+    ) -> T {
+        let set = self
+            .publication
+            .expect("publication support is checked before input ownership is transferred");
+        unsafe { set(context, Some(callback)) };
+        let _reset = PublicationReset(set);
+        invoke()
     }
 
     fn call_raw(&self, symbol: &str, inputs: &[AbiValue], outputs: &mut [AbiValue]) {
@@ -353,6 +385,7 @@ mod tests {
             _library: libloading::os::unix::Library::this().into(),
             functions,
             allocation_budget: None,
+            publication: None,
         }
     }
 
@@ -386,6 +419,7 @@ mod tests {
         let library = libloading::os::unix::Library::this().into();
         let executor = Executor::new(library, &SignatureTable::new()).unwrap();
         assert!(!executor.supports_allocation_budget());
+        assert!(!executor.supports_publication());
     }
 
     #[test]
