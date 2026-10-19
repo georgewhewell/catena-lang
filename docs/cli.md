@@ -1,126 +1,82 @@
 # Compiler CLI
 
-The compiler CLI is provided by the `catena-lang` package. Run it from the
-repository root:
+Run the compiler from the repository root:
 
 ```sh
 cargo run -p catena-lang -- program.hex -o report
 ```
 
-After `cargo install catena-lang`, the equivalent command is:
+After `cargo install catena-lang`, use `catena-lang program.hex -o report`.
+The CLI compiles input files and writes compiler reports and generated code.
+It uses the experimental GPU code generator and its embedded standard library.
+It does not execute programs. On compilation failure it writes available partial
+reports and exits with an error. Input-loading errors occur before reporting.
 
-```sh
-catena-lang program.hex -o report
-```
-
-The CLI compiles one or more input files and writes compiler reports and
-generated code to the output directory. It does not execute the program. If
-compilation fails, it writes the available partial report and exits with an
-error. Input-loading errors occur before report generation.
-
-Stage starts, completions, elapsed times, and closure-conversion progress are
-printed to stderr. `timings.json` records each completed or failed stage with
-`stage`, `elapsed_ms`, and `status`, including partial runs. Report generation
-(including SVG rendering) is timed separately from compilation.
-
-The separate `catena-cli` package currently provides only a `status` command.
+Stage progress and elapsed times are printed to stderr. `timings.json` records
+completed or failed stages, including partial runs. Report generation is timed
+separately. The separate `catena-cli` package provides a `status` command.
 
 ## Options
 
 | Argument or option | Behavior |
 | --- | --- |
-| `<PATHS>...` | One or more source files, loaded in the supplied order. |
+| `<PATHS>...` | Input files or directories; directories load `.hex` files recursively. |
 | `-o`, `--output-dir <PATH>` | Required directory for compilation reports. |
 | `--no-svg` | Skip SVG graph rendering. |
 | `--dialect <NAME>` | Select `hip` (default) or `cuda`. |
-| `--codegen <NAME>` | Select `default` (implicit) or `experimental`. |
-| `--stdlib <NAME>` | Select a named bundle; repeat to select multiple bundles. |
-| `--stdlib-dir <PATH>` | Load and select a local bundle containing `stdlib.json`; repeat for multiple directories. |
+| `--codegen <NAME>` | Accepts `experimental`, the default and only code generator. |
+| `--stdlib <NAME>` | Select a named embedded bundle; repeat for multiple selections. |
+| `--stdlib-dir <PATH>` | Load `.hex` files recursively from a directory; repeat for multiple directories. |
 | `--no-stdlib` | Load only input files; conflicts with both stdlib selection options. |
 | `-h`, `--help` | Show usage and options. |
 | `-V`, `--version` | Show the version. |
 
-## Code generator selection
-
-```sh
-cargo run -p catena-lang -- program.hex -o report --codegen default
-
-cargo run -p catena-lang -- program.hex -o report \
-  --stdlib-dir catena-lang/stdlib/experimental --codegen experimental
-```
-
-The accepted names are `default` and `experimental`; `gpu` is not an alias.
-Codegen and stdlib selection are independent: selecting a codegen does not load
-a library, and selecting a library does not change the codegen.
-
-Both backends share the compiler passes through closure conversion and product
-unpacking, then use separate lowering and rendering to emit one runtime module
-for the selected dialect. The CLI writes its source to `gpu/hip.cpp` or
-`gpu/cuda.cpp`. Unsupported arrows or runtime types are reported as errors.
+The compiler emits one runtime module for the selected dialect. Its source is
+written to `gpu/hip.cpp` or `gpu/cuda.cpp`. Unsupported operations and runtime
+types are reported as errors.
 
 ## Standard library selection
 
-Without selection flags, the CLI loads the embedded `default` bundle before
-input files. Explicit selections replace that implicit choice:
+Without selection flags, the CLI loads the embedded `stdlib` bundle from
+[`catena-lang/stdlib/experimental/`](../catena-lang/stdlib/experimental/).
+Explicit selections replace that implicit choice:
 
 ```sh
-# Explicitly select the embedded default bundle
-cargo run -p catena-lang -- program.hex -o report --stdlib default
+# Explicitly select the embedded library
+cargo run -p catena-lang -- program.hex -o report --stdlib stdlib
 
-# Select a local bundle
+# Load a directory of library sources
 cargo run -p catena-lang -- program.hex -o report --stdlib-dir ./my-stdlib
 
-# Combine the embedded default and a local bundle
+# Combine the embedded library and additional sources
 cargo run -p catena-lang -- program.hex -o report \
-  --stdlib default --stdlib-dir ./my-stdlib
+  --stdlib stdlib --stdlib-dir ./my-stdlib
 
-# Supply all language definitions through the input files
+# Supply every definition through input files
 cargo run -p catena-lang -- definitions.hex program.hex -o report --no-stdlib
 ```
 
-`default` is currently the only embedded bundle. Local bundle names must differ
-from embedded names and from other registered local bundles.
+Named selections are loaded first in flag order, then directory sources in flag
+order. Input files follow library sources. Duplicate definitions are errors.
+Directory loading ignores manifests and reads `.hex` files recursively.
 
-Named selections are visited first in their flag order, then local bundles in
-their flag order. Dependencies are loaded before their dependents, once per
-bundle. Input files follow all library sources. Unknown bundle names,
-dependency cycles, and duplicate definitions are errors.
+## Bundle manifests for library clients
 
-## Bundle folders and manifests
+Rust clients can use `stdlib::sources()` to access the embedded library, or
+`stdlib::BundleRegistry` to register bundles with `add_directory`.
+The experimental library is embedded in the order declared by its
+[`stdlib.json`](../catena-lang/stdlib/experimental/stdlib.json) manifest.
 
-The current library lives in
-[`catena-lang/stdlib/default/`](../catena-lang/stdlib/default/). Its
-[`stdlib.json`](../catena-lang/stdlib/default/stdlib.json) contains:
-
-```json
-{"name": "default"}
-```
-
-A bundle loads every `.hex` file directly in its directory, sorted by filename.
-Subdirectories and other file types are ignored. The default library is
-embedded at build time using the same rule, so adding a `.hex` file requires
-no file-list update; rebuild the CLI to embed it.
-
-Place additional bundles in sibling folders or outside the repository:
-
-```text
-my-stdlib/
-  stdlib.json
-  operations.hex
-  arrays.hex
-```
-
-Only `name` is required. To extend the embedded library, use:
+A local manifest requires a `name`. An optional `extends` list names dependencies,
+which must also be registered or embedded. Dependencies are resolved first and
+loaded once. Unknown names, dependency cycles, and duplicate bundle names are
+errors. For example:
 
 ```json
-{"name": "my-stdlib", "extends": ["default"]}
+{"name": "my-stdlib", "extends": ["stdlib"], "files": ["operations.hex"]}
 ```
 
-Omit `extends` for a standalone bundle. Local dependencies must also be supplied
-with `--stdlib-dir`; all directories are registered before dependencies are
-resolved, so their command-line order need not match dependency order.
-
-An optional `files` array replaces automatic discovery with an explicit ordered
-list, for example `"files": ["operations.hex", "arrays.hex"]`. Paths are relative
-to the bundle directory and cannot contain `..`. An empty list loads no source
-files from that bundle. Unknown manifest fields are rejected.
+An optional `files` array specifies an ordered list of relative source paths,
+including subdirectories. Paths cannot contain `..`. An empty list loads no
+source files. Without `files`, the registry loads `.hex` files directly in the
+bundle directory, sorted by filename. Unknown manifest fields are rejected.

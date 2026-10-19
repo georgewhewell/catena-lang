@@ -73,8 +73,7 @@ pub enum ConversionError {
 /// Region discovery, generated-arrow construction, validation, and replacement
 /// remain separate implementation modules, but callers receive one coherent
 /// result which preserves every useful intermediate representation.
-/// This entry point uses default stdlib primitives; the compiler selects the
-/// experimental primitive policy explicitly through `run_with_progress`.
+/// Uses the experimental standard library primitive interfaces.
 pub fn run(
     theory_set: &TheorySet,
     forgotten: &TheoryTermMap<ClosureForgotten<Operation>>,
@@ -82,7 +81,7 @@ pub fn run(
     run_with_progress(
         theory_set,
         forgotten,
-        crate::codegen::CodegenKind::Default,
+        crate::codegen::CodegenKind::Experimental,
         &mut |_| {},
     )
 }
@@ -99,10 +98,7 @@ pub(crate) fn run_with_progress(
     let inlined_definitions = inline_named_calls::run(theory_set, forgotten)?;
     let closure_forgotten_definitions = inlined_definitions.clone();
 
-    // Both stdlibs declare their converted interfaces; only the name table differs.
     let primitives = match codegen {
-        crate::codegen::CodegenKind::Default => replace::CONVERTED_PRIMITIVES,
-        // TODO stdlib also might define callbacks without val wrapper
         crate::codegen::CodegenKind::Experimental => {
             crate::codegen::experimental::primitives::CONVERTED_PRIMITIVES
         }

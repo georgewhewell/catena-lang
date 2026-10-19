@@ -653,7 +653,7 @@ mod tests {
         };
         let mut body = AnnotatedTerm::empty();
         let source = body.new_node(object("val", vec![object("u64", vec![])]));
-        let target = body.new_node(object("val", vec![object("ix", vec![Tree::Leaf(4, ())])]));
+        let target = body.new_node(object("val", vec![object("mem", vec![Tree::Leaf(4, ())])]));
         body.sources = vec![source];
         body.targets = vec![target];
 

@@ -5,16 +5,20 @@ fn cli_writes_only_the_selected_dialect() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("empty.hex");
     fs::write(&input, "")?;
-    for backend in ["default", "experimental"] {
+    for explicit_codegen in [false, true] {
         for dialect in ["hip", "cuda"] {
-            let output_dir = directory.path().join(format!("{backend}-{dialect}"));
+            let output_dir = directory
+                .path()
+                .join(format!("{explicit_codegen}-{dialect}"));
             let mut command = Command::new(env!("CARGO_BIN_EXE_catena-lang"));
-            command.arg(&input).arg("-o").arg(&output_dir).args([
-                "--no-stdlib",
-                "--no-svg",
-                "--codegen",
-                backend,
-            ]);
+            command
+                .arg(&input)
+                .arg("-o")
+                .arg(&output_dir)
+                .args(["--no-stdlib", "--no-svg"]);
+            if explicit_codegen {
+                command.args(["--codegen", "experimental"]);
+            }
             // HIP is also the CLI default.
             if dialect == "cuda" {
                 command.args(["--dialect", dialect]);

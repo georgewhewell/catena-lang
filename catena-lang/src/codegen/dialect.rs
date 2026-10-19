@@ -1,4 +1,4 @@
-//! HIP/CUDA spellings shared by code generators.
+//! HIP/CUDA spellings for GPU code generation.
 
 use super::GpuDialect;
 
@@ -49,20 +49,6 @@ impl GpuDialect {
         match self {
             Self::Hip => "hipDeviceSynchronize",
             Self::Cuda => "cudaDeviceSynchronize",
-        }
-    }
-
-    pub(crate) fn memcpy_fn(self) -> &'static str {
-        match self {
-            Self::Hip => "hipMemcpy",
-            Self::Cuda => "cudaMemcpy",
-        }
-    }
-
-    pub(crate) fn memcpy_device_to_host(self) -> &'static str {
-        match self {
-            Self::Hip => "hipMemcpyDeviceToHost",
-            Self::Cuda => "cudaMemcpyDeviceToHost",
         }
     }
 

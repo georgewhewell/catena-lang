@@ -54,17 +54,14 @@ struct Cli {
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum CodegenArg {
-    /// The default GPU C++ code generator.
+    /// The experimental GPU C++ code generator.
     #[default]
-    Default,
-    /// The standalone experimental GPU C++ code generator.
     Experimental,
 }
 
 impl From<CodegenArg> for CodegenKind {
     fn from(value: CodegenArg) -> Self {
         match value {
-            CodegenArg::Default => Self::Default,
             CodegenArg::Experimental => Self::Experimental,
         }
     }
@@ -150,7 +147,7 @@ fn selected_stdlib(cli: &Cli) -> anyhow::Result<Vec<SourceFile>> {
     let registry = BundleRegistry::default();
     let mut names = cli.stdlibs.clone();
     if names.is_empty() && cli.stdlib_dirs.is_empty() {
-        names.push("default".into());
+        names.push("stdlib".into());
     }
     let mut sources = registry.resolve(&names.iter().map(String::as_str).collect::<Vec<_>>())?;
     for filename in input_files(&cli.stdlib_dirs)? {
@@ -283,7 +280,7 @@ mod tests {
     #[test]
     fn stdlib_default_explicit_and_disabled_selection() -> anyhow::Result<()> {
         let default = selected_stdlib(&cli_with(&[]))?;
-        let explicit = selected_stdlib(&cli_with(&["--stdlib", "default", "--stdlib", "default"]))?;
+        let explicit = selected_stdlib(&cli_with(&["--stdlib", "stdlib", "--stdlib", "stdlib"]))?;
         assert_eq!(
             default.iter().map(|file| &file.source).collect::<Vec<_>>(),
             explicit.iter().map(|file| &file.source).collect::<Vec<_>>()
@@ -300,7 +297,7 @@ mod tests {
                     "report",
                     "--no-stdlib",
                     flag,
-                    "default"
+                    "stdlib"
                 ])
                 .is_err()
             );
@@ -344,9 +341,10 @@ mod tests {
         let directory = tempfile::tempdir()?;
         fs::write(
             directory.path().join("stdlib.json"),
-            r#"{"name":"custom","extends":["default"],"files":["custom.hex"]}"#,
+            r#"{"name":"custom","extends":["stdlib"],"files":["custom.hex"]}"#,
         )?;
-        let definition = "(def program custom.one : [] -> (u64 val) = (u64.one))";
+        let definition =
+            "(def program custom.one : [] -> (u64 val) = (const.u64.0x0000000000000001))";
         fs::write(directory.path().join("custom.hex"), definition)?;
         let input = directory.path().join("program.hex");
         fs::write(
@@ -355,7 +353,7 @@ mod tests {
         )?;
         let mut cli = cli_with(&[
             "--stdlib",
-            "default",
+            "stdlib",
             "--stdlib-dir",
             directory.path().to_str().unwrap(),
         ]);
@@ -396,25 +394,10 @@ mod tests {
     }
 
     #[test]
-    fn default_codegen_is_the_default() {
+    fn experimental_codegen_is_the_default() {
         let cli = Cli::try_parse_from(["catena", "input.hex", "--output-dir", "report"]).unwrap();
 
-        assert!(matches!(cli.codegen, CodegenArg::Default));
-    }
-
-    #[test]
-    fn default_codegen_can_be_selected_explicitly() {
-        let cli = Cli::try_parse_from([
-            "catena",
-            "input.hex",
-            "--output-dir",
-            "report",
-            "--codegen",
-            "default",
-        ])
-        .unwrap();
-
-        assert!(matches!(cli.codegen, CodegenArg::Default));
+        assert!(matches!(cli.codegen, CodegenArg::Experimental));
     }
 
     #[test]

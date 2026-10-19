@@ -1,9 +1,8 @@
-//! Code generator selection and dispatch.
+//! GPU code generation.
 //!
-//! Each backend owns its lowering, intermediate representation, and rendering.
+//! The backend owns its lowering, intermediate representation, and rendering.
 //! The public entrypoint returns a runtime module; backend IR stays internal.
 
-mod default;
 mod dialect;
 pub(crate) mod experimental;
 
@@ -22,14 +21,11 @@ type CodegenTermMap = TheoryTermMap<OperationWithBoundarySizes<Operation>>;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CodegenKind {
     #[default]
-    Default,
     Experimental,
 }
 
 #[derive(Debug, Error)]
 pub enum CodegenError {
-    #[error(transparent)]
-    Default(#[from] default::CodegenError),
     #[error(transparent)]
     Experimental(#[from] experimental::CodegenError),
 }
@@ -42,7 +38,6 @@ pub fn codegen(
 ) -> Result<RuntimeModule, CodegenError> {
     assert_closures_converted(terms);
     match kind {
-        CodegenKind::Default => default::codegen(terms, dialect).map_err(CodegenError::from),
         CodegenKind::Experimental => {
             experimental::codegen(terms, dialect).map_err(CodegenError::from)
         }
@@ -90,54 +85,54 @@ mod tests {
     use open_hypergraphs::lax::OpenHypergraph;
 
     #[test]
-    fn both_backends_reject_unconverted_closures_at_entry() {
-        for kind in [CodegenKind::Default, CodegenKind::Experimental] {
-            for (name, output) in [
-                ("defer", Tree::Empty),
-                ("run", Tree::Empty),
-                ("compose", Tree::Empty),
-                ("tensor", Tree::Empty),
-                ("lift", Tree::Empty),
-                ("evaluate", Tree::Empty),
-                ("closure.marker", Tree::Empty),
-                (
-                    "opaque",
-                    Tree::Node(
-                        "*".parse().unwrap(),
-                        0,
-                        vec![
-                            Tree::Empty,
-                            Tree::Node("=>".parse().unwrap(), 0, vec![Tree::Empty, Tree::Empty]),
-                        ],
-                    ),
+    fn codegen_rejects_unconverted_closures_at_entry() {
+        for (name, output) in [
+            ("defer", Tree::Empty),
+            ("run", Tree::Empty),
+            ("compose", Tree::Empty),
+            ("tensor", Tree::Empty),
+            ("lift", Tree::Empty),
+            ("evaluate", Tree::Empty),
+            ("closure.marker", Tree::Empty),
+            (
+                "opaque",
+                Tree::Node(
+                    "*".parse().unwrap(),
+                    0,
+                    vec![
+                        Tree::Empty,
+                        Tree::Node("=>".parse().unwrap(), 0, vec![Tree::Empty, Tree::Empty]),
+                    ],
                 ),
-                (
-                    "opaque",
-                    Tree::Node("=>".parse().unwrap(), 0, vec![Tree::Empty, Tree::Empty]),
-                ),
-            ] {
-                let term = OpenHypergraph::singleton(
-                    OperationWithBoundarySizes {
-                        operation: name.parse().unwrap(),
-                        source_sizes: vec![],
-                        target_sizes: vec![1],
-                    },
-                    vec![],
-                    vec![output],
-                );
-                let terms = std::collections::BTreeMap::from([(
-                    TheoryId("program".parse().unwrap()),
-                    std::collections::BTreeMap::from([("test".parse().unwrap(), term)]),
-                )]);
-                let panic = std::panic::catch_unwind(|| codegen(kind, &terms, GpuDialect::Cuda))
-                    .expect_err("unconverted closures must panic at the codegen boundary");
-                assert!(
-                    panic
-                        .downcast_ref::<String>()
-                        .unwrap()
-                        .contains("closures must have been converted")
-                );
-            }
+            ),
+            (
+                "opaque",
+                Tree::Node("=>".parse().unwrap(), 0, vec![Tree::Empty, Tree::Empty]),
+            ),
+        ] {
+            let term = OpenHypergraph::singleton(
+                OperationWithBoundarySizes {
+                    operation: name.parse().unwrap(),
+                    source_sizes: vec![],
+                    target_sizes: vec![1],
+                },
+                vec![],
+                vec![output],
+            );
+            let terms = std::collections::BTreeMap::from([(
+                TheoryId("program".parse().unwrap()),
+                std::collections::BTreeMap::from([("test".parse().unwrap(), term)]),
+            )]);
+            let panic = std::panic::catch_unwind(|| {
+                codegen(CodegenKind::Experimental, &terms, GpuDialect::Cuda)
+            })
+            .expect_err("unconverted closures must panic at the codegen boundary");
+            assert!(
+                panic
+                    .downcast_ref::<String>()
+                    .unwrap()
+                    .contains("closures must have been converted")
+            );
         }
     }
 }
