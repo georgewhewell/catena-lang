@@ -91,5 +91,5 @@ On the pod:
 
 ```bash
 cd /workspace/catena-lang
-CATENA_GPU_DIALECT=cuda cargo test -p catena-lang --features runtime-tests --test runtime
+CATENA_GPU_DIALECT=cuda cargo test -p catena-lang --features runtime-tests --test experimental_runtime
 ```

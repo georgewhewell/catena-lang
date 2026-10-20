@@ -730,7 +730,7 @@ mod tests {
         let source = r#"
             (def program apply-closure :
               ({1 (bool val)} =>) -> ({(bool val) (bool val)} *)
-              = (run bool.copy *.intro))
+              = (run [value . value value] *.intro))
             (def program use-named-closure :
               (bool val) -> ({(bool val) (bool val)} *)
               = ([captured.]

@@ -1,5 +1,4 @@
-//! Callback aliases owned by the experimental backend. Closure conversion
-//! uses this table only when experimental codegen is selected.
+//! Callback aliases used by closure conversion and the experimental backend.
 
 pub(crate) const CONVERTED_PRIMITIVES: &[(&str, &str)] = &[
     ("core.if", "core.ifc"),

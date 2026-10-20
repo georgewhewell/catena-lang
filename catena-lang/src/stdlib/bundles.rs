@@ -147,7 +147,7 @@ impl BundleRegistry {
 
     /// Resolve roots in selection order, dependencies in declaration order,
     /// and files in manifest order (or filename order when omitted). Each bundle is included only once. Empty
-    /// roots select nothing; callers choose whether to request `default`.
+    /// roots select nothing; callers choose whether to request `stdlib`.
     pub fn resolve(&self, names: &[&str]) -> anyhow::Result<Vec<SourceFile>> {
         let mut visited = BTreeSet::new();
         let mut active = Vec::new();

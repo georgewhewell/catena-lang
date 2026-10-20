@@ -1,7 +1,6 @@
 {
   "files": [
     "stdlib/**/*.hex",
-    "report/elaboration/generated.hex",
-    "examples/**/*.hex"
+    "report/elaboration/generated.hex"
   ]
 }

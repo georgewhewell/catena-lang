@@ -41,7 +41,7 @@ fn experimental_matmul_fixtures_compile_without_gpu() -> anyhow::Result<()> {
 }
 
 #[test]
-fn experimental_library_typechecks_without_default_sources() -> anyhow::Result<()> {
+fn experimental_library_typechecks() -> anyhow::Result<()> {
     let mut registry = BundleRegistry::new(&[])?;
     let name = registry.add_directory(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/experimental"),

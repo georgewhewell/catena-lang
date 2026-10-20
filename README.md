@@ -22,12 +22,13 @@ decentralised platform for trustless AI compute:
     cargo install catena-lang
 
 Catena is intended to be called as a **library**.
-here's how to run a program that adds two `u64` values:
+here's how to run a program that returns a `u64` value:
 
 ```rust
 use catena_lang::{
-    codegen,
+    codegen::CodegenKind,
     compile::compile,
+    report::CompileReport,
     runtime::{GpuDialect, Runtime, Value},
     stdlib,
 };
@@ -36,50 +37,25 @@ use metacat::theory::RawTheorySet;
 fn main() -> anyhow::Result<()> {
     // programs in hexpr notation: https://github.com/hellas-ai/hexpr
     let source = r#"
-        (def program two-plus-two : [] -> (u64 val) = (
-          ({u64.one u64.one} u64.add)
-          {[two . two two]}
-          u64.add
-        ))
+        (def program identity : (u64 val) -> (u64 val) = [value])
     "#;
 
-    let report = compile(RawTheorySet::from_texts(
+    let mut report = CompileReport::new(RawTheorySet::from_texts(
         stdlib::sources().chain([source]),
-    )?)?;
-    let module = codegen::runtime_module(
-        report
-            .gpu_modules
-            .as_ref()
-            .expect("successful compilation should contain generated modules"),
-        GpuDialect::Hip,
-    )?;
+    )?);
+    let module = compile(&mut report, CodegenKind::Experimental, GpuDialect::Hip)?;
     let mut runtime = Runtime::new(GpuDialect::Hip)?;
     let artifact = runtime.load(module)?;
-    let [result] = artifact.exec("two-plus-two", [])?;
+    let [result] = artifact.exec("identity", [4_u64.into()])?;
     let Value::U64(result) = result else {
-        anyhow::bail!("two-plus-two returned non-u64 value: {result:?}");
+        anyhow::bail!("identity returned non-u64 value: {result:?}");
     };
 
-    println!("2 + 2 = {result}");
+    println!("Result: {result}");
     assert_eq!(result, 4);
     Ok(())
 }
 ```
 
-A more complete example is available as
-[catena-lang/examples/runtime.rs](catena-lang/examples/runtime.rs):
-
-```sh
-cargo run -p catena-lang --example runtime
-```
-
-NOTE: by default this will run using the
-[HIP](https://rocm.docs.amd.com/projects/HIP/en/latest/) backend.
-With [Nix](https://nix.dev/), you can run the example with the required
-dependencies as follows:
-
-```sh
-nix develop --command cargo run -p catena-lang --example runtime
-```
-
-Experimental backend [BF16 support and precision rules](BF16.md).
+The experimental code generator and its standard library are used by default.
+See [CLI usage](docs/cli.md) and [BF16 support and precision rules](BF16.md).

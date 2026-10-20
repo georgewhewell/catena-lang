@@ -18,17 +18,17 @@
 //!     let mut report = CompileReport::new(RawTheorySet::from_texts(
 //!         stdlib::sources().chain([PROGRAM]),
 //!     )?);
-//!     let module = compile(&mut report, CodegenKind::Default, runtime.dialect())?;
+//!     let module = compile(&mut report, CodegenKind::Experimental, runtime.dialect())?;
 //!     let artifact = runtime.load(module)?;
-//!     let [result] = artifact.exec("add-one", [41_u64.into()])?;
+//!     let [result] = artifact.exec("identity", [41_u64.into()])?;
 //!     let Value::U64(sum) = result else {
-//!         panic!("`add-one` returned an unexpected value: {result:?}");
+//!         panic!("`identity` returned an unexpected value: {result:?}");
 //!     };
-//!     assert_eq!(sum, 42);
+//!     assert_eq!(sum, 41);
 //!     Ok(())
 //! }
 //!
-//! const PROGRAM: &str = "(def program add-one : (u64 val) -> (u64 val) = ({_ const.u64.0x0000000000000001} u64.add))";
+//! const PROGRAM: &str = "(def program identity : (u64 val) -> (u64 val) = [value])";
 //! ```
 //!
 //! ## Quick reference

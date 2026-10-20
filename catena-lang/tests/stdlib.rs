@@ -3,11 +3,11 @@ use std::fs;
 use catena_lang::stdlib::{self, BundleRegistry, StdlibBundle, StdlibFile};
 
 #[test]
-fn default_manifest_loads_the_same_files_as_the_embedded_bundle() -> anyhow::Result<()> {
+fn experimental_manifest_loads_the_same_files_as_the_embedded_bundle() -> anyhow::Result<()> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut registry = BundleRegistry::new(&[])?;
-    let name = registry.add_directory(root.join("stdlib/default"))?;
-    assert_eq!(name, "default");
+    let name = registry.add_directory(root.join("stdlib/experimental"))?;
+    assert_eq!(name, "stdlib");
     let files = registry.resolve(&[&name])?;
     assert_eq!(
         files
@@ -49,9 +49,9 @@ fn minimal_manifest_loads_all_hex_files_in_filename_order() -> anyhow::Result<()
 }
 
 #[test]
-fn default_bundle_preserves_existing_sources() -> anyhow::Result<()> {
+fn embedded_bundle_preserves_existing_sources() -> anyhow::Result<()> {
     let registry = BundleRegistry::default();
-    let files = registry.resolve(&["default", "default"])?;
+    let files = registry.resolve(&["stdlib", "stdlib"])?;
     assert_eq!(
         files
             .iter()
@@ -188,7 +188,7 @@ fn local_manifest_preserves_order_and_selects_only_declared_dependencies() -> an
 
     fs::write(
         directory.path().join("stdlib.json"),
-        r#"{"name":"extension","extends":["default","custom"],"files":[]}"#,
+        r#"{"name":"extension","extends":["stdlib","custom"],"files":[]}"#,
     )?;
     registry.add_directory(directory.path())?;
     assert_eq!(
@@ -205,7 +205,7 @@ fn invalid_local_manifests_report_the_manifest_or_source_path() -> anyhow::Resul
     for json in [
         "not json",
         r#"{"name":"custom","files":[],"typo":true}"#,
-        r#"{"name":"default","files":[]}"#,
+        r#"{"name":"stdlib","files":[]}"#,
         r#"{"name":"","files":[]}"#,
         r#"{"name":"custom","files":["../outside.hex"]}"#,
         r#"{"name":"custom","files":["/outside.hex"]}"#,
