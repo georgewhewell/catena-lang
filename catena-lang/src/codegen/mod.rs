@@ -3,8 +3,8 @@
 //! The backend owns its lowering, intermediate representation, and rendering.
 //! The public entrypoint returns a runtime module; backend IR stays internal.
 
+pub(crate) mod default;
 mod dialect;
-pub(crate) mod experimental;
 
 use hexpr::Operation;
 use thiserror::Error;
@@ -21,13 +21,13 @@ type CodegenTermMap = TheoryTermMap<OperationWithBoundarySizes<Operation>>;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CodegenKind {
     #[default]
-    Experimental,
+    Default,
 }
 
 #[derive(Debug, Error)]
 pub enum CodegenError {
     #[error(transparent)]
-    Experimental(#[from] experimental::CodegenError),
+    Default(#[from] default::CodegenError),
 }
 
 /// Generate C++ source and runtime metadata from closure-converted terms.
@@ -38,9 +38,7 @@ pub fn codegen(
 ) -> Result<RuntimeModule, CodegenError> {
     assert_closures_converted(terms);
     match kind {
-        CodegenKind::Experimental => {
-            experimental::codegen(terms, dialect).map_err(CodegenError::from)
-        }
+        CodegenKind::Default => default::codegen(terms, dialect).map_err(CodegenError::from),
     }
 }
 
@@ -124,7 +122,7 @@ mod tests {
                 std::collections::BTreeMap::from([("test".parse().unwrap(), term)]),
             )]);
             let panic = std::panic::catch_unwind(|| {
-                codegen(CodegenKind::Experimental, &terms, GpuDialect::Cuda)
+                codegen(CodegenKind::Default, &terms, GpuDialect::Cuda)
             })
             .expect_err("unconverted closures must panic at the codegen boundary");
             assert!(

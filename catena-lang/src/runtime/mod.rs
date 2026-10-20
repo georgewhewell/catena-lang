@@ -18,7 +18,7 @@
 //!     let mut report = CompileReport::new(RawTheorySet::from_texts(
 //!         stdlib::sources().chain([PROGRAM]),
 //!     )?);
-//!     let module = compile(&mut report, CodegenKind::Experimental, runtime.dialect())?;
+//!     let module = compile(&mut report, CodegenKind::Default, runtime.dialect())?;
 //!     let artifact = runtime.load(module)?;
 //!     let [result] = artifact.exec("identity", [41_u64.into()])?;
 //!     let Value::U64(sum) = result else {

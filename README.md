@@ -43,7 +43,7 @@ fn main() -> anyhow::Result<()> {
     let mut report = CompileReport::new(RawTheorySet::from_texts(
         stdlib::sources().chain([source]),
     )?);
-    let module = compile(&mut report, CodegenKind::Experimental, GpuDialect::Hip)?;
+    let module = compile(&mut report, CodegenKind::Default, GpuDialect::Hip)?;
     let mut runtime = Runtime::new(GpuDialect::Hip)?;
     let artifact = runtime.load(module)?;
     let [result] = artifact.exec("identity", [4_u64.into()])?;
@@ -57,5 +57,5 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-The experimental code generator and its standard library are used by default.
+The default code generator and its standard library are used by default.
 See [CLI usage](docs/cli.md) and [BF16 support and precision rules](BF16.md).

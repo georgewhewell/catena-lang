@@ -1,4 +1,4 @@
-//! Experimental GPU lowering of typed, closure-converted graphs.
+//! Default GPU lowering of typed, closure-converted graphs.
 //!
 //! The compiler also reads callback aliases from `primitives`. Lowering, IR,
 //! and rendering are private to this module and its descendants.
@@ -32,19 +32,19 @@ use values::*;
 
 #[derive(Debug, Error)]
 pub enum CodegenError {
-    #[error("experimental codegen: invalid GPU IR in `{function}`: {reason}")]
+    #[error("default codegen: invalid GPU IR in `{function}`: {reason}")]
     InvalidIr { function: String, reason: String },
-    #[error("experimental codegen: {0}")]
+    #[error("default codegen: {0}")]
     Type(String),
-    #[error("experimental codegen: type `{0:?}` has no runtime representation")]
+    #[error("default codegen: type `{0:?}` has no runtime representation")]
     NoRuntimeRepresentation(Obj),
-    #[error("experimental codegen does not support arrow `{0}`")]
+    #[error("default codegen does not support arrow `{0}`")]
     Unsupported(String),
-    #[error("experimental codegen: invalid `{op}`: {reason}")]
+    #[error("default codegen: invalid `{op}`: {reason}")]
     Invalid { op: String, reason: String },
-    #[error("experimental codegen: recursive definition `{0}` requires an explicit fold")]
+    #[error("default codegen: recursive definition `{0}` requires an explicit fold")]
     Recursive(String),
-    #[error("experimental codegen: SSA decomposition failed: {0}")]
+    #[error("default codegen: SSA decomposition failed: {0}")]
     Ssa(#[from] metacat::ssa::SSAError),
 }
 

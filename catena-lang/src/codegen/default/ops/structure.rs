@@ -1,6 +1,6 @@
 //! Preserve runtime values across type ascriptions.
 use super::super::{CodegenError, Lowerer, invalid, values::*};
-pub(in crate::codegen::experimental) fn lower(
+pub(in crate::codegen::default) fn lower(
     l: &mut Lowerer<'_>,
     op: &str,
     args: Vec<Value>,

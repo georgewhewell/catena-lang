@@ -73,7 +73,7 @@ pub enum ConversionError {
 /// Region discovery, generated-arrow construction, validation, and replacement
 /// remain separate implementation modules, but callers receive one coherent
 /// result which preserves every useful intermediate representation.
-/// Uses the experimental standard library primitive interfaces.
+/// Uses the default standard library primitive interfaces.
 pub fn run(
     theory_set: &TheorySet,
     forgotten: &TheoryTermMap<ClosureForgotten<Operation>>,
@@ -81,7 +81,7 @@ pub fn run(
     run_with_progress(
         theory_set,
         forgotten,
-        crate::codegen::CodegenKind::Experimental,
+        crate::codegen::CodegenKind::Default,
         &mut |_| {},
     )
 }
@@ -99,8 +99,8 @@ pub(crate) fn run_with_progress(
     let closure_forgotten_definitions = inlined_definitions.clone();
 
     let primitives = match codegen {
-        crate::codegen::CodegenKind::Experimental => {
-            crate::codegen::experimental::primitives::CONVERTED_PRIMITIVES
+        crate::codegen::CodegenKind::Default => {
+            crate::codegen::default::primitives::CONVERTED_PRIMITIVES
         }
     };
     let converted = region_conversion::run(theory_set, inlined_definitions, primitives, progress)?;

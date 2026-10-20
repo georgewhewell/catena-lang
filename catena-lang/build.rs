@@ -5,12 +5,12 @@ use std::{
 };
 
 fn main() {
-    embed_experimental_sources().unwrap_or_else(|error| panic!("{error}"));
+    embed_stdlib_sources().unwrap_or_else(|error| panic!("{error}"));
 }
 
-fn embed_experimental_sources() -> Result<(), String> {
+fn embed_stdlib_sources() -> Result<(), String> {
     let directory =
-        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("stdlib/experimental");
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("stdlib/default");
     let manifest_path = directory.join("stdlib.json");
     println!("cargo:rerun-if-changed={}", manifest_path.display());
     let text = fs::read_to_string(&manifest_path)
@@ -61,7 +61,6 @@ fn embed_experimental_sources() -> Result<(), String> {
         ));
     }
     sources.push_str("]\n");
-    let output =
-        PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("experimental_stdlib_files.rs");
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("stdlib_files.rs");
     fs::write(&output, sources).map_err(|error| format!("write {}: {error}", output.display()))
 }

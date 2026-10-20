@@ -1,4 +1,4 @@
-//! Callback aliases used by closure conversion and the experimental backend.
+//! Callback aliases used by closure conversion and the default backend.
 
 pub(crate) const CONVERTED_PRIMITIVES: &[(&str, &str)] = &[
     ("core.if", "core.ifc"),

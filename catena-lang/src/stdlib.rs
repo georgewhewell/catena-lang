@@ -31,9 +31,8 @@ pub struct StdlibFile {
     pub source: &'static str,
 }
 
-/// Experimental standard library sources, embedded in manifest order at build time.
-pub const FILES: &[StdlibFile] =
-    include!(concat!(env!("OUT_DIR"), "/experimental_stdlib_files.rs"));
+/// Default standard library sources, embedded in manifest order at build time.
+pub const FILES: &[StdlibFile] = include!(concat!(env!("OUT_DIR"), "/stdlib_files.rs"));
 
 /// Embedded bundles available by name. Dependencies are loaded before files.
 pub const BUNDLES: &[StdlibBundle] = &[StdlibBundle {
@@ -47,17 +46,12 @@ pub fn sources() -> impl ExactSizeIterator<Item = &'static str> {
 }
 
 pub fn paths_from(root: impl AsRef<Path>) -> impl ExactSizeIterator<Item = PathBuf> {
-    let stdlib = root.as_ref().join("stdlib/experimental");
+    let stdlib = root.as_ref().join("stdlib/default");
     FILES.iter().map(move |file| stdlib.join(file.filename))
 }
 
-/// Alias for the experimental standard library sources.
-pub fn experimental_sources() -> impl ExactSizeIterator<Item = &'static str> {
-    sources()
-}
-
-/// Experimental primitives and core helpers, excluding optional matmul helpers.
-pub fn experimental_core_sources() -> impl Iterator<Item = &'static str> {
+/// Default primitives and core helpers, excluding optional matmul helpers.
+pub fn core_sources() -> impl Iterator<Item = &'static str> {
     FILES
         .iter()
         .filter(|file| file.filename != "gpu/matmul.hex")

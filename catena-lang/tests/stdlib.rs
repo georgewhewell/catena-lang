@@ -3,10 +3,10 @@ use std::fs;
 use catena_lang::stdlib::{self, BundleRegistry, StdlibBundle, StdlibFile};
 
 #[test]
-fn experimental_manifest_loads_the_same_files_as_the_embedded_bundle() -> anyhow::Result<()> {
+fn default_manifest_loads_the_same_files_as_the_embedded_bundle() -> anyhow::Result<()> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut registry = BundleRegistry::new(&[])?;
-    let name = registry.add_directory(root.join("stdlib/experimental"))?;
+    let name = registry.add_directory(root.join("stdlib/default"))?;
     assert_eq!(name, "stdlib");
     let files = registry.resolve(&[&name])?;
     assert_eq!(

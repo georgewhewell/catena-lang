@@ -8,7 +8,7 @@ cargo run -p catena-lang -- program.hex -o report
 
 After `cargo install catena-lang`, use `catena-lang program.hex -o report`.
 The CLI compiles input files and writes compiler reports and generated code.
-It uses the experimental GPU code generator and its embedded standard library.
+It uses the default GPU code generator and its embedded standard library.
 It does not execute programs. On compilation failure it writes available partial
 reports and exits with an error. Input-loading errors occur before reporting.
 
@@ -24,7 +24,6 @@ separately. The separate `catena-cli` package provides a `status` command.
 | `-o`, `--output-dir <PATH>` | Required directory for compilation reports. |
 | `--no-svg` | Skip SVG graph rendering. |
 | `--dialect <NAME>` | Select `hip` (default) or `cuda`. |
-| `--codegen <NAME>` | Accepts `experimental`, the default and only code generator. |
 | `--stdlib <NAME>` | Select a named embedded bundle; repeat for multiple selections. |
 | `--stdlib-dir <PATH>` | Load `.hex` files recursively from a directory; repeat for multiple directories. |
 | `--no-stdlib` | Load only input files; conflicts with both stdlib selection options. |
@@ -38,7 +37,7 @@ types are reported as errors.
 ## Standard library selection
 
 Without selection flags, the CLI loads the embedded `stdlib` bundle from
-[`catena-lang/stdlib/experimental/`](../catena-lang/stdlib/experimental/).
+[`catena-lang/stdlib/default/`](../catena-lang/stdlib/default/).
 Explicit selections replace that implicit choice:
 
 ```sh
@@ -64,8 +63,8 @@ Directory loading ignores manifests and reads `.hex` files recursively.
 
 Rust clients can use `stdlib::sources()` to access the embedded library, or
 `stdlib::BundleRegistry` to register bundles with `add_directory`.
-The experimental library is embedded in the order declared by its
-[`stdlib.json`](../catena-lang/stdlib/experimental/stdlib.json) manifest.
+The default library is embedded in the order declared by its
+[`stdlib.json`](../catena-lang/stdlib/default/stdlib.json) manifest.
 
 A local manifest requires a `name`. An optional `extends` list names dependencies,
 which must also be registered or embedded. Dependencies are resolved first and

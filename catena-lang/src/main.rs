@@ -31,10 +31,6 @@ struct Cli {
     #[arg(long)]
     no_svg: bool,
 
-    /// Code generator to use.
-    #[arg(long, value_enum, default_value_t)]
-    codegen: CodegenArg,
-
     /// GPU dialect to generate.
     #[arg(long, value_enum, default_value_t)]
     dialect: DialectArg,
@@ -50,21 +46,6 @@ struct Cli {
     /// Compile only the supplied input files, without a standard library.
     #[arg(long, conflicts_with_all = ["stdlibs", "stdlib_dirs"])]
     no_stdlib: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
-enum CodegenArg {
-    /// The experimental GPU C++ code generator.
-    #[default]
-    Experimental,
-}
-
-impl From<CodegenArg> for CodegenKind {
-    fn from(value: CodegenArg) -> Self {
-        match value {
-            CodegenArg::Experimental => Self::Experimental,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -93,7 +74,7 @@ fn main() -> anyhow::Result<()> {
     let mut report = CompileReport::new(raw_theories);
     let result = catena_lang::compile::compile_with_progress(
         &mut report,
-        cli.codegen.into(),
+        CodegenKind::Default,
         cli.dialect.into(),
         &mut print_progress,
     );
@@ -360,7 +341,7 @@ mod tests {
         cli.paths = vec![input.clone()];
         catena_lang::compile::compile(
             &mut CompileReport::new(load_theories(&cli)?),
-            cli.codegen.into(),
+            CodegenKind::Default,
             cli.dialect.into(),
         )?;
 
@@ -368,7 +349,7 @@ mod tests {
         let theories = load_theories(&cli)?;
         let error = catena_lang::compile::compile(
             &mut CompileReport::new(theories),
-            cli.codegen.into(),
+            CodegenKind::Default,
             cli.dialect.into(),
         )
         .unwrap_err()
@@ -391,28 +372,5 @@ mod tests {
                 .unwrap();
 
         assert!(cli.no_svg);
-    }
-
-    #[test]
-    fn experimental_codegen_is_the_default() {
-        let cli = Cli::try_parse_from(["catena", "input.hex", "--output-dir", "report"]).unwrap();
-
-        assert!(matches!(cli.codegen, CodegenArg::Experimental));
-    }
-
-    #[test]
-    fn experimental_codegen_is_explicit_and_does_not_select_a_stdlib() {
-        let cli = cli_with(&["--codegen", "experimental"]);
-        assert_eq!(CodegenKind::from(cli.codegen), CodegenKind::Experimental);
-        assert!(cli.stdlibs.is_empty());
-        assert!(cli.stdlib_dirs.is_empty());
-    }
-
-    #[test]
-    fn gpu_is_not_a_codegen_alias() {
-        assert!(
-            Cli::try_parse_from(["catena", "input.hex", "-o", "report", "--codegen", "gpu"])
-                .is_err()
-        );
     }
 }

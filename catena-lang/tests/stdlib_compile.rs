@@ -2,20 +2,17 @@ use catena_lang::{check, elaborate, stdlib::BundleRegistry};
 use metacat::theory::{RawTheorySet, TheorySet};
 
 #[test]
-fn experimental_matmul_fixtures_compile_without_gpu() -> anyhow::Result<()> {
+fn default_matmul_fixtures_compile_without_gpu() -> anyhow::Result<()> {
     use catena_lang::{
         codegen::CodegenKind, compile::compile, report::CompileReport, runtime::GpuDialect,
     };
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut registry = BundleRegistry::new(&[])?;
-    let name = registry.add_directory(root.join("stdlib/experimental"))?;
+    let name = registry.add_directory(root.join("stdlib/default"))?;
     let files = registry.resolve(&[&name])?;
     for fixture in ["matmul_naive_u64.hex", "matmul_tiled_u64.hex"] {
-        let source = std::fs::read_to_string(
-            root.join("tests/experimental_runtime/fixtures")
-                .join(fixture),
-        )?;
+        let source = std::fs::read_to_string(root.join("tests/runtime/fixtures").join(fixture))?;
         let raw = RawTheorySet::from_texts(
             files
                 .iter()
@@ -23,7 +20,7 @@ fn experimental_matmul_fixtures_compile_without_gpu() -> anyhow::Result<()> {
                 .chain([source.as_str()]),
         )?;
         let mut report = CompileReport::new(raw);
-        let module = compile(&mut report, CodegenKind::Experimental, GpuDialect::Hip)
+        let module = compile(&mut report, CodegenKind::Default, GpuDialect::Hip)
             .unwrap_or_else(|error| panic!("compiling {fixture}: {error}"));
         let entry = if fixture == "matmul_naive_u64.hex" {
             "matmul_simple_naive.main.matmul"
@@ -41,11 +38,10 @@ fn experimental_matmul_fixtures_compile_without_gpu() -> anyhow::Result<()> {
 }
 
 #[test]
-fn experimental_library_typechecks() -> anyhow::Result<()> {
+fn default_library_typechecks() -> anyhow::Result<()> {
     let mut registry = BundleRegistry::new(&[])?;
-    let name = registry.add_directory(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/experimental"),
-    )?;
+    let name = registry
+        .add_directory(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/default"))?;
     let files = registry.resolve(&[&name])?;
     let raw = RawTheorySet::from_texts(files.iter().map(|file| file.source.as_ref()))?;
     // Literal declarations are synthesized by elaboration rather than exported
