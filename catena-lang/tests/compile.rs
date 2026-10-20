@@ -14,7 +14,7 @@ fn codegen_produces_a_runtime_module() -> anyhow::Result<()> {
     )?;
     for dialect in [GpuDialect::Hip, GpuDialect::Cuda] {
         let mut report = CompileReport::new(raw.clone());
-        let module = compile(&mut report, codegen::CodegenKind::Experimental, dialect)?;
+        let module = compile(&mut report, codegen::CodegenKind::Default, dialect)?;
         assert_eq!(module.dialect, dialect);
         assert!(!module.source.is_empty());
         let identity = module
@@ -29,13 +29,9 @@ fn codegen_produces_a_runtime_module() -> anyhow::Result<()> {
 }
 
 #[test]
-fn experimental_codegen_uses_shared_passes_and_dispatch() -> anyhow::Result<()> {
+fn default_codegen_uses_shared_passes_and_dispatch() -> anyhow::Result<()> {
     let mut report = CompileReport::new(RawTheorySet::from_text("")?);
-    let module = compile(
-        &mut report,
-        codegen::CodegenKind::Experimental,
-        GpuDialect::Hip,
-    )?;
+    let module = compile(&mut report, codegen::CodegenKind::Default, GpuDialect::Hip)?;
     assert_eq!(module.dialect, GpuDialect::Hip);
     assert!(report.closure_conversion.is_some());
     assert!(report.unpacked_products.is_some());

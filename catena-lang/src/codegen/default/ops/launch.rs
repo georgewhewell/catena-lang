@@ -41,7 +41,7 @@ fn kernel_argument(
     }
 }
 
-pub(in crate::codegen::experimental) fn lower(
+pub(in crate::codegen::default) fn lower(
     l: &mut Lowerer<'_>,
     op: &str,
     args: &[Value],

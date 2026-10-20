@@ -8,15 +8,13 @@ use catena_lang::{
 };
 use metacat::theory::RawTheorySet;
 fn build(source: &str, dialect: GpuDialect) -> anyhow::Result<RuntimeModule> {
-    let mut sources = stdlib::experimental_core_sources().collect::<Vec<_>>();
-    sources.push(include_str!(
-        "experimental_runtime/fixtures/bf16_numeric.hex"
-    ));
+    let mut sources = stdlib::core_sources().collect::<Vec<_>>();
+    sources.push(include_str!("runtime/fixtures/bf16_numeric.hex"));
     sources.push(source);
     let raw = RawTheorySet::from_texts(sources)?;
     Ok(compile(
         &mut CompileReport::new(raw),
-        CodegenKind::Experimental,
+        CodegenKind::Default,
         dialect,
     )?)
 }
@@ -39,7 +37,7 @@ fn shared_scalar_operations_keep_bf16_types() -> anyhow::Result<()> {
 }
 #[test]
 fn typed_memory_and_device_dot_require_native_hip() -> anyhow::Result<()> {
-    let source = include_str!("experimental_runtime/fixtures/bf16.hex");
+    let source = include_str!("runtime/fixtures/bf16.hex");
     let module = build(source, GpuDialect::Hip)?;
     assert!(module.source.contains("__builtin_amdgcn_fdot2_f32_bf16"));
     assert!(module.source.contains("catena_global<catena_bf16x2_t>"));
@@ -77,9 +75,7 @@ fn f32_modules_do_not_include_bf16_support() -> anyhow::Result<()> {
 
 #[test]
 fn removed_primitives_are_not_in_the_library() {
-    let source = stdlib::experimental_core_sources()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let source = stdlib::core_sources().collect::<Vec<_>>().join("\n");
     for declaration in [
         "(arr u16 :",
         "(arr bf16.add ",

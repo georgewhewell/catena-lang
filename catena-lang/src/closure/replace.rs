@@ -957,15 +957,11 @@ mod tests {
     }
 
     #[test]
-    fn experimental_stdlib_declares_matching_converted_interfaces() {
-        use crate::{
-            codegen::experimental::primitives::CONVERTED_PRIMITIVES, stdlib::BundleRegistry,
-        };
+    fn default_stdlib_declares_matching_converted_interfaces() {
+        use crate::{codegen::default::primitives::CONVERTED_PRIMITIVES, stdlib::BundleRegistry};
         let mut registry = BundleRegistry::new(&[]).unwrap();
         let name = registry
-            .add_directory(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/experimental"),
-            )
+            .add_directory(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("stdlib/default"))
             .unwrap();
         let files = registry.resolve(&[&name]).unwrap();
         let raw = metacat::theory::RawTheorySet::from_texts(

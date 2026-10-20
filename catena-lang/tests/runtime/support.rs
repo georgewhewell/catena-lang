@@ -14,11 +14,9 @@ pub fn runtime_with_fixture(fixture: &str) -> anyhow::Result<(Runtime, Artifact)
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dialect = configured_gpu_dialect()?;
     let mut registry = BundleRegistry::new(&[])?;
-    let name = registry.add_directory(root.join("stdlib/experimental"))?;
+    let name = registry.add_directory(root.join("stdlib/default"))?;
     let files = registry.resolve(&[&name])?;
-    let path = root
-        .join("tests/experimental_runtime/fixtures")
-        .join(fixture);
+    let path = root.join("tests/runtime/fixtures").join(fixture);
     let source = std::fs::read_to_string(&path)
         .with_context(|| format!("reading runtime fixture {}", path.display()))?;
     let raw = RawTheorySet::from_texts(
@@ -28,8 +26,8 @@ pub fn runtime_with_fixture(fixture: &str) -> anyhow::Result<(Runtime, Artifact)
             .chain([source.as_str()]),
     )?;
     let mut report = CompileReport::new(raw);
-    let module = compile(&mut report, CodegenKind::Experimental, dialect)
-        .with_context(|| format!("compiling experimental runtime fixture {fixture}"))?;
+    let module = compile(&mut report, CodegenKind::Default, dialect)
+        .with_context(|| format!("compiling default runtime fixture {fixture}"))?;
     let mut runtime = Runtime::new(dialect)?;
     let artifact = runtime.load(module)?;
     Ok((runtime, artifact))

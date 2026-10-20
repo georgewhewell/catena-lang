@@ -38,6 +38,6 @@ runtime-tests = []
 svg-reports = ["dep:open-hypergraphs-dot"]
 
 [[test]]
-name = "experimental_runtime"
-path = "tests/experimental_runtime.rs"
+name = "runtime"
+path = "tests/runtime.rs"
 required-features = ["runtime-tests"]

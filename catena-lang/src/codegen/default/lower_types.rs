@@ -1,4 +1,4 @@
-//! Representation rules for experimental types. Unknown runtime types are errors.
+//! Representation rules for default types. Unknown runtime types are errors.
 use super::{CodegenError, values::Obj};
 use crate::runtime::ValueKind;
 use metacat::tree::Tree;
@@ -78,7 +78,7 @@ pub(super) fn concrete(ty: &Obj) -> Result<CType, CodegenError> {
         }
         _ => {
             return Err(CodegenError::Type(format!(
-                "unsupported experimental runtime type {ty:?}"
+                "unsupported default runtime type {ty:?}"
             )));
         }
     };
