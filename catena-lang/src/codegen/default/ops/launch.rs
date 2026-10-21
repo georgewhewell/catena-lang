@@ -6,6 +6,51 @@ use super::super::{
     values::*,
 };
 
+/// Full callback/capture types determine specialization; runtime expressions
+/// remain arguments. Canonicalize scoped witness IDs jointly across the key.
+#[derive(PartialEq, Eq)]
+pub(in crate::codegen::default) struct KernelKey {
+    function: hexpr::Operation,
+    types: Vec<Obj>,
+    functions: Vec<Option<hexpr::Operation>>,
+}
+fn key(callback: &Callback<'_>) -> Option<KernelKey> {
+    let Repr::Function(function) = &callback.function.repr else {
+        return None;
+    };
+    let mut types = vec![callback.function.ty.clone()];
+    let mut functions = Vec::new();
+    for capture in &callback.captures {
+        types.push(capture.ty.clone());
+        functions.push(match &capture.repr {
+            Repr::Function(op) => Some(op.clone()),
+            Repr::Runtime(_) | Repr::Erased => None,
+            Repr::Product(_) => return None,
+        });
+    }
+    fn canonical(t: &Obj, ids: &mut std::collections::BTreeMap<usize, usize>) -> Obj {
+        use metacat::tree::Tree;
+        match t {
+            Tree::Leaf(id, ()) => {
+                let next = ids.len();
+                Tree::Leaf(*ids.entry(*id).or_insert(next), ())
+            }
+            Tree::Node(op, port, children) => Tree::Node(
+                op.clone(),
+                *port,
+                children.iter().map(|t| canonical(t, ids)).collect(),
+            ),
+            Tree::Empty => Tree::Empty,
+        }
+    }
+    let mut ids = std::collections::BTreeMap::new();
+    Some(KernelKey {
+        function: function.clone(),
+        types: types.iter().map(|t| canonical(t, &mut ids)).collect(),
+        functions,
+    })
+}
+
 fn kernel_argument(
     l: &mut Lowerer<'_>,
     op: &str,
@@ -70,6 +115,28 @@ pub(in crate::codegen::default) fn lower(
         "0".into()
     };
     let callback = Callback::new(kernel, environment)?;
+    let specialization = key(&callback);
+    if let Some(symbol) = specialization.as_ref().and_then(|key| {
+        l.kernel_cache
+            .iter()
+            .find(|(previous, _)| previous == key)
+            .map(|(_, symbol)| symbol.clone())
+    }) {
+        let mut arguments = vec![expr(grid)?.to_owned()];
+        for capture in &callback.captures {
+            if let Repr::Runtime(expression) = &capture.repr {
+                arguments.push(expression.clone());
+            }
+        }
+        l.body.push(Instruction::Launch {
+            kernel: symbol,
+            grid: expr(grid)?.to_owned(),
+            shared_bytes,
+            arguments,
+        });
+        return outputs.iter().map(|ty| l.erased(ty)).collect();
+    }
+
     let grid_expression = expr(grid)?.to_owned();
     let grid_parameter = l.fresh("grid");
     let mut inputs = vec![Variable {
@@ -110,6 +177,9 @@ pub(in crate::codegen::default) fn lower(
             body,
         },
     );
+    if let Some(key) = specialization {
+        l.kernel_cache.push((key, symbol.clone()));
+    }
     l.body.push(Instruction::Launch {
         kernel: symbol,
         grid: grid_expression,
@@ -117,4 +187,57 @@ pub(in crate::codegen::default) fn lower(
         arguments,
     });
     outputs.iter().map(|ty| l.erased(ty)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metacat::tree::Tree;
+
+    fn specialization(
+        a: usize,
+        b: usize,
+        capture: usize,
+        expression: &str,
+        nested: Option<&str>,
+    ) -> KernelKey {
+        let function = Value {
+            ty: Tree::Node(
+                "function-type".parse().unwrap(),
+                0,
+                vec![Tree::Leaf(a, ()), Tree::Leaf(b, ())],
+            ),
+            repr: Repr::Function("kernel".parse().unwrap()),
+        };
+        let callback = Callback {
+            function: &function,
+            captures: vec![Value {
+                ty: Tree::Node(
+                    "capture-type".parse().unwrap(),
+                    0,
+                    vec![Tree::Leaf(capture, ())],
+                ),
+                repr: nested.map_or_else(
+                    || Repr::Runtime(expression.into()),
+                    |f| Repr::Function(f.parse().unwrap()),
+                ),
+            }],
+            parameters: vec![],
+            outputs: vec![],
+        };
+        key(&callback).unwrap()
+    }
+
+    #[test]
+    fn kernel_specializations_preserve_witness_relationships_and_function_captures() {
+        let first = specialization(1, 2, 1, "first_buffer", None);
+        assert!(first == specialization(41, 82, 41, "other_buffer", None));
+        assert!(first != specialization(41, 82, 82, "other_buffer", None));
+        assert!(first != specialization(41, 41, 41, "other_buffer", None));
+        assert!(
+            specialization(1, 2, 1, "", Some("first"))
+                != specialization(1, 2, 1, "", Some("second"))
+        );
+        assert!(first != specialization(1, 2, 1, "", Some("first")));
+    }
 }

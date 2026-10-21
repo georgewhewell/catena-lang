@@ -345,6 +345,49 @@ fn launch_captures_values_and_emits_both_dialects() {
     };
     assert_eq!(shared_bytes, "host_layout.bytes");
     assert_eq!(arguments, &["host_grid", "host_flag"]);
+    let repeated = l
+        .lower_operation(
+            "unsafe.launch_shared",
+            vec![
+                value(
+                    node(
+                        "val",
+                        vec![node(
+                            "stdlib.gpu.geometry.type.Grid",
+                            vec![Tree::Leaf(5, ()), Tree::Leaf(6, ())],
+                        )],
+                    ),
+                    "second_grid",
+                ),
+                value(
+                    node(
+                        "val",
+                        vec![node(
+                            "stdlib.gpu.memory.type.SharedLayout",
+                            vec![node("list.Nil", vec![])],
+                        )],
+                    ),
+                    "second_layout",
+                ),
+                value(scalar("bool"), "second_flag"),
+                Value {
+                    ty: node("val", vec![node("->", vec![scalar("bool"), proof()])]),
+                    repr: Repr::Function("stdlib.assert.assert_true".parse().unwrap()),
+                },
+            ],
+            &[node("1", vec![])],
+        )
+        .unwrap();
+    assert!(matches!(repeated[0].repr, Repr::Erased));
+    assert_eq!(
+        l.modules.kernels.len(),
+        1,
+        "runtime captures must not specialize device code"
+    );
+    let Instruction::Launch { arguments, .. } = &l.body[1] else {
+        panic!("missing repeated launch")
+    };
+    assert_eq!(arguments, &["second_grid", "second_flag"]);
     l.modules.functions.insert(
         "entry".into(),
         Function {

@@ -5,6 +5,7 @@ use std::{
 };
 
 fn main() {
+    compiler_fingerprint();
     embed_stdlib_sources().unwrap_or_else(|error| panic!("{error}"));
 }
 
@@ -63,4 +64,66 @@ fn embed_stdlib_sources() -> Result<(), String> {
     sources.push_str("]\n");
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("stdlib_files.rs");
     fs::write(&output, sources).map_err(|error| format!("write {}: {error}", output.display()))
+}
+
+// Invalidate persistent modules on compiler, stdlib, dependency, or feature changes,
+// including edits that have not been committed. Paths are relative for reproducibility.
+fn compiler_fingerprint() {
+    use sha2::{Digest, Sha256};
+    fn walk(path: &std::path::Path, paths: &mut Vec<PathBuf>) {
+        if path.is_dir() {
+            println!("cargo:rerun-if-changed={}", path.display());
+            for entry in fs::read_dir(path).unwrap() {
+                walk(&entry.unwrap().path(), paths);
+            }
+        } else {
+            paths.push(path.to_owned());
+        }
+    }
+    fn part(hash: &mut Sha256, bytes: &[u8]) {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let mut paths = vec![
+        root.join("Cargo.toml"),
+        root.join("build.rs"),
+        root.join("../Cargo.toml"),
+        root.join("../Cargo.lock"),
+    ];
+    walk(&root.join("src"), &mut paths);
+    walk(&root.join("stdlib"), &mut paths);
+    paths.sort();
+    let mut hash = Sha256::new();
+    for path in paths {
+        println!("cargo:rerun-if-changed={}", path.display());
+        part(
+            &mut hash,
+            path.strip_prefix(&root)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .as_bytes(),
+        );
+        match fs::read(&path) {
+            Ok(bytes) => {
+                part(&mut hash, b"present");
+                part(&mut hash, &bytes);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => part(&mut hash, b"missing"),
+            Err(e) => panic!("fingerprint {}: {e}", path.display()),
+        }
+    }
+    let mut configuration = env::vars()
+        .filter(|(k, _)| k.starts_with("CARGO_FEATURE_") || k == "TARGET")
+        .collect::<Vec<_>>();
+    configuration.sort();
+    for (k, v) in configuration {
+        part(&mut hash, k.as_bytes());
+        part(&mut hash, v.as_bytes());
+    }
+    println!(
+        "cargo:rustc-env=CATENA_COMPILER_FINGERPRINT={:x}",
+        hash.finalize()
+    );
 }

@@ -67,6 +67,9 @@ pub mod runtime;
 /// Rendered source and public entry-point metadata accepted by the runtime.
 mod runtime_module;
 
+/// Persistent cache of generated GPU source and public ABI.
+mod module_cache;
+
 /// Compile generated GPU C++ to a shared object.
 mod artifact;
 
@@ -84,6 +87,7 @@ pub use dialect::GpuDialect;
 pub use mem::MemError;
 pub use mem::MemOwn;
 pub use mem::MemRef;
+pub use module_cache::ModuleCache;
 pub use runtime::{Artifact, ExecError, InitError, Runtime};
 pub use runtime_module::{GeneratedFunction, RuntimeModule};
 pub use value::Value;
