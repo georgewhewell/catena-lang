@@ -36,7 +36,7 @@ fn shared_scalar_operations_keep_bf16_types() -> anyhow::Result<()> {
     Ok(())
 }
 #[test]
-fn typed_memory_and_device_dot_require_native_hip() -> anyhow::Result<()> {
+fn typed_memory_and_device_dot_support_both_backends() -> anyhow::Result<()> {
     let source = include_str!("runtime/fixtures/bf16.hex");
     let module = build(source, GpuDialect::Hip)?;
     assert!(module.source.contains("__builtin_amdgcn_fdot2_f32_bf16"));
@@ -45,8 +45,10 @@ fn typed_memory_and_device_dot_require_native_hip() -> anyhow::Result<()> {
     assert!(module.source.contains("catena_global<catena_bf16_t>"));
     assert!(module.source.contains("catena_mem_count<catena_bf16x2_t>"));
     assert!(module.source.contains("#error \"native packed BF16 dot"));
-    let error = build(source, GpuDialect::Cuda).unwrap_err().to_string();
-    assert!(error.contains("requires HIP gfx11"), "{error}");
+    let cuda = build(source, GpuDialect::Cuda)?;
+    assert!(cuda.source.contains("#include <cuda_bf16.h>"));
+    assert!(cuda.source.contains("__double2float_rn(__dadd_rn("));
+    assert!(cuda.source.contains("catena_global<catena_bf16x2_t>"));
     Ok(())
 }
 #[test]

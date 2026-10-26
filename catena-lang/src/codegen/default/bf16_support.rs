@@ -1,4 +1,4 @@
-//! BF16 native SDK operations; no widened elementwise model arithmetic.
+//! BF16 SDK operations and backend-specific packed dot accumulation.
 use crate::runtime::GpuDialect;
 
 fn native_support(dialect: GpuDialect) -> String {
@@ -63,6 +63,13 @@ __host__ __device__ inline float catena_bf16_dot(catena_bf16x2_t a,catena_bf16x2
     union { uint32_t bits; bf16x2 values; } x,y;
     x.bits=a.bits; y.bits=b.bits;
     return __builtin_amdgcn_fdot2_f32_bf16(x.values,y.values,acc,false);
+#elif defined(__CUDA_ARCH__)
+    // CUDA has no per-thread equivalent of AMD fdot2. Keep BF16 storage and
+    // evaluate the pair in double before a single F32 boundary conversion.
+    // Explicit round-to-nearest intrinsics prevent contraction/reassociation.
+    double lo = __dmul_rn(double(catena_bf16_to_f32(catena_bf16_low(a))), double(catena_bf16_to_f32(catena_bf16_low(b))));
+    double hi = __dmul_rn(double(catena_bf16_to_f32(catena_bf16_high(a))), double(catena_bf16_to_f32(catena_bf16_high(b))));
+    return __double2float_rn(__dadd_rn(__dadd_rn(lo, hi), double(acc)));
 #elif defined(CATENA_BF16_CPU_EMULATION)
     // Test-only emulator: never a device fallback. One rounding after the pair sum.
     return float(double(catena_bf16_to_f32(catena_bf16_low(a)))*double(catena_bf16_to_f32(catena_bf16_low(b))) + double(catena_bf16_to_f32(catena_bf16_high(a)))*double(catena_bf16_to_f32(catena_bf16_high(b))) + double(acc));
