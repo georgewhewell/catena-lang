@@ -82,6 +82,13 @@ mod signature;
 //#[cfg(test)]
 //mod tests;
 
+/// Whether generated code may be read from or written to persistent caches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CachePolicy {
+    Persistent,
+    Ephemeral,
+}
+
 pub use artifact::ArtifactError;
 pub use dialect::GpuDialect;
 pub use mem::MemError;

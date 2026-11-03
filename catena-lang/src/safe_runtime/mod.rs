@@ -29,8 +29,8 @@ use self::{
     },
 };
 use crate::runtime::{
-    Artifact as RuntimeArtifact, ExecError, GpuDialect, MemError, MemOwn, Runtime, RuntimeModule,
-    Value,
+    Artifact as RuntimeArtifact, CachePolicy, ExecError, GpuDialect, MemError, MemOwn, Runtime,
+    RuntimeModule, Value,
 };
 
 const CHILD_MODE_ENV: &str = "CATENA_SAFE_RUNTIME_CHILD";
@@ -40,6 +40,8 @@ const CHILD_MODE_ENV: &str = "CATENA_SAFE_RUNTIME_CHILD";
 pub enum SafeInitError {
     #[error("failed to identify the current executable: {0}")]
     CurrentExecutable(#[source] io::Error),
+    #[error("failed to create SafeRuntime child build directory: {0}")]
+    CreateBuildDir(#[source] io::Error),
     #[error("failed to spawn SafeRuntime child {executable}: {source}")]
     Spawn {
         executable: PathBuf,
@@ -121,9 +123,14 @@ struct SafeSession {
 impl SafeRuntime {
     /// Create a process-isolated context for the selected GPU dialect.
     pub fn new(dialect: GpuDialect) -> Result<Self, SafeInitError> {
+        Self::new_with_cache(dialect, CachePolicy::Persistent)
+    }
+
+    /// Set native and driver caching before the child's GPU libraries initialize.
+    pub fn new_with_cache(dialect: GpuDialect, cache: CachePolicy) -> Result<Self, SafeInitError> {
         let executable = env::current_exe().map_err(SafeInitError::CurrentExecutable)?;
         let ipc = IpcTransport::load(dialect)?;
-        let mut worker = WorkerProcess::spawn(&executable)?;
+        let mut worker = WorkerProcess::spawn(&executable, cache)?;
         worker
             .send(&Request::Initialize { dialect })
             .map_err(map_init_worker_error)?;
@@ -601,6 +608,7 @@ struct WorkerProcess {
     stdout: BufReader<ChildStdout>,
     stderr_reader: Option<JoinHandle<Vec<u8>>>,
     termination: Option<Termination>,
+    _build_dir: Option<tempfile::TempDir>,
 }
 
 #[derive(Debug, Error)]
@@ -614,17 +622,30 @@ enum WorkerError {
 }
 
 impl WorkerProcess {
-    fn spawn(executable: &Path) -> Result<Self, SafeInitError> {
-        let mut child = Command::new(executable)
+    fn spawn(executable: &Path, cache: CachePolicy) -> Result<Self, SafeInitError> {
+        let build_dir = (cache == CachePolicy::Ephemeral)
+            .then(|| tempfile::Builder::new().prefix("catena-worker-").tempdir())
+            .transpose()
+            .map_err(SafeInitError::CreateBuildDir)?;
+        let mut command = Command::new(executable);
+        command
             .env(CHILD_MODE_ENV, "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| SafeInitError::Spawn {
-                executable: executable.to_path_buf(),
-                source,
-            })?;
+            .stderr(Stdio::piped());
+        if let Some(build_dir) = &build_dir {
+            command
+                .env("TMPDIR", build_dir.path())
+                .env("TMP", build_dir.path())
+                .env("TEMP", build_dir.path())
+                .env("CATENA_NATIVE_CACHE", "0")
+                .env("AMD_COMGR_CACHE", "0")
+                .env("CUDA_CACHE_DISABLE", "1");
+        }
+        let mut child = command.spawn().map_err(|source| SafeInitError::Spawn {
+            executable: executable.to_path_buf(),
+            source,
+        })?;
         let stdin = child
             .stdin
             .take()
@@ -649,6 +670,7 @@ impl WorkerProcess {
             stdout: BufReader::new(stdout),
             stderr_reader: Some(stderr_reader),
             termination: None,
+            _build_dir: build_dir,
         })
     }
 
@@ -728,5 +750,71 @@ fn map_exec_worker_error(error: WorkerError) -> SafeExecError {
             stderr: termination.stderr,
         },
         other => SafeExecError::Transport(other.to_string()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::{fs, io::BufRead, os::unix::fs::PermissionsExt};
+
+    #[test]
+    fn worker_build_files_are_removed_after_exit_or_kill() {
+        let fixture = tempfile::tempdir().unwrap();
+        let executable = fixture.path().join("worker");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+build=$(mktemp -d)
+echo private-program > "$build/module.cpp"
+printf '%s\n' "$build"
+read release || :
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        for killed in [false, true] {
+            let mut worker = WorkerProcess::spawn(&executable, CachePolicy::Ephemeral).unwrap();
+            let mut path = String::new();
+            worker.stdout.read_line(&mut path).unwrap();
+            let path = PathBuf::from(path.trim());
+            assert_eq!(
+                fs::read(path.join("module.cpp")).unwrap(),
+                b"private-program\n"
+            );
+            if killed {
+                worker.child.kill().unwrap();
+            }
+            drop(worker);
+            assert!(!path.exists(), "worker build files survived");
+        }
+    }
+
+    #[test]
+    fn private_cache_policy_does_not_change_public_workers() {
+        let fixture = tempfile::tempdir().unwrap();
+        let executable = fixture.path().join("worker");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"${CATENA_NATIVE_CACHE-unset}\" \"${AMD_COMGR_CACHE-unset}\" \"${CUDA_CACHE_DISABLE-unset}\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut private = WorkerProcess::spawn(&executable, CachePolicy::Ephemeral).unwrap();
+        let mut public = WorkerProcess::spawn(&executable, CachePolicy::Persistent).unwrap();
+        let mut private_env = String::new();
+        let mut public_env = String::new();
+        private.stdout.read_to_string(&mut private_env).unwrap();
+        public.stdout.read_to_string(&mut public_env).unwrap();
+        assert_eq!(private_env, "0\n0\n1\n");
+        assert_eq!(
+            public_env,
+            format!(
+                "{}\n{}\n{}\n",
+                env::var("CATENA_NATIVE_CACHE").unwrap_or("unset".into()),
+                env::var("AMD_COMGR_CACHE").unwrap_or("unset".into()),
+                env::var("CUDA_CACHE_DISABLE").unwrap_or("unset".into())
+            )
+        );
     }
 }
